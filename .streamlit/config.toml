@@ -1,0 +1,10 @@
+# Keeps the app chrome on the same light surface the charts are drawn on.
+[theme]
+base = "light"
+primaryColor = "#2a78d6"
+backgroundColor = "#fcfcfb"
+secondaryBackgroundColor = "#f0efec"
+textColor = "#0b0b0b"
+
+[browser]
+gatherUsageStats = false

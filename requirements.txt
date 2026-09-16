@@ -1,0 +1,6 @@
+# Pinned to the versions this project was built and tested against.
+numpy==2.5.3
+pandas==3.0.5
+plotly==7.1.0
+streamlit==1.64.0
+pytest==9.1.1
