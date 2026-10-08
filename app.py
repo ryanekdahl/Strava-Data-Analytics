@@ -21,14 +21,18 @@ from src.consistency import (
     weekly_streaks, weekly_volume,
 )
 from src.generate_sample import generate_sample
+from src.heart_rate import hr_coverage, monthly_zone_hours, zone_distribution
 from src.loader import SAMPLE_CSV, find_real_export, load_activities
 from src.performance import (
-    best_effort_frontier, best_recent_effort, format_duration, format_pace,
+    RIEGEL_EXPONENT, best_effort_frontier, best_recent_effort, format_duration, format_pace,
     personal_records, predict_races, recent_vs_all_time, rolling_hr, rolling_pace,
 )
+from src.race_calculator import (
+    CALCULATOR_DISTANCES, EXPONENT_RANGE, calculator_predictions, parse_duration,
+)
 from src.training_load import (
-    compute_activity_load, compute_fitness_freshness, daily_load_series,
-    estimate_threshold_pace, form_label,
+    DEFAULT_HR_MAX, DEFAULT_HR_REST, compute_activity_load, compute_fitness_freshness,
+    daily_load_series, estimate_threshold_pace, form_label,
 )
 
 st.set_page_config(page_title="Strava Run Analytics", page_icon=":running_shirt_with_sash:",
@@ -36,10 +40,10 @@ st.set_page_config(page_title="Strava Run Analytics", page_icon=":running_shirt_
 
 
 @st.cache_data(show_spinner="Crunching activities...")
-def build_analytics(path: str, _mtime: float) -> dict:
-    """Run the whole pipeline once per file; ``_mtime`` busts the cache on edit."""
+def build_analytics(path: str, _mtime: float, hr_rest: float, hr_max: float) -> dict:
+    """Run the whole pipeline once per file and HR setting; ``_mtime`` busts the cache on edit."""
     activities = load_activities(path)
-    with_load = compute_activity_load(activities)
+    with_load = compute_activity_load(activities, hr_rest=hr_rest, hr_max=hr_max)
     daily = daily_load_series(with_load)
     return {
         "activities": activities,
@@ -51,6 +55,10 @@ def build_analytics(path: str, _mtime: float) -> dict:
         "frontier": best_effort_frontier(activities),
         "records": personal_records(activities),
         "threshold_pace": estimate_threshold_pace(activities),
+        "zones": zone_distribution(activities, hr_rest, hr_max),
+        "monthly_zones": monthly_zone_hours(activities, hr_rest, hr_max),
+        "hr_rest": hr_rest,
+        "hr_max": hr_max,
     }
 
 
@@ -74,6 +82,19 @@ def choose_source() -> Path:
             "and drop `activities.csv` into `data/raw/`."
         )
     return sources[label]
+
+
+def choose_heart_rate() -> tuple[float, float]:
+    """Sidebar inputs for resting and max HR, used by the load model and zones."""
+    st.sidebar.subheader("Heart rate")
+    hr_rest = st.sidebar.number_input("Resting HR (bpm)", 30, 100, int(DEFAULT_HR_REST))
+    hr_max = st.sidebar.number_input("Max HR (bpm)", 120, 230, int(DEFAULT_HR_MAX))
+    st.sidebar.caption("Defaults are assumptions; your own values sharpen training "
+                       "load and heart-rate zones.")
+    if hr_max <= hr_rest + 20:
+        st.sidebar.warning("Max HR should be well above resting HR; using the defaults.")
+        return DEFAULT_HR_REST, DEFAULT_HR_MAX
+    return float(hr_rest), float(hr_max)
 
 
 def overview_tab(data: dict) -> None:
@@ -172,6 +193,8 @@ def performance_tab(data: dict) -> None:
             f"It is reliable from 5K to the half and optimistic for the marathon."
         )
 
+    race_calculator(effort)
+
     st.subheader("Recent form vs all-time best")
     comparison = recent_vs_all_time(activities)
     comparison["Gap"] = comparison["gap_pct"].map(
@@ -191,6 +214,74 @@ def performance_tab(data: dict) -> None:
     with trend_right:
         st.plotly_chart(plots.heart_rate_figure(rolling_hr(activities)), width="stretch")
         st.caption("Average heart rate per run. A falling line at a steady pace means fitness gains.")
+
+
+def race_calculator(effort) -> None:
+    """Type in any result and get Riegel predictions at every standard distance."""
+    st.subheader("Race-time calculator")
+    names = list(CALCULATOR_DISTANCES)
+    default_time = format_duration(effort.time_s * (5.0 / effort.distance_km) ** RIEGEL_EXPONENT)
+    cols = st.columns([1, 1, 2])
+    distance = cols[0].selectbox("Distance", names, index=names.index("5K"))
+    entered = cols[1].text_input("Your time (H:MM:SS or MM:SS)", value=default_time)
+    exponent = cols[2].slider("Riegel exponent", *EXPONENT_RANGE, value=RIEGEL_EXPONENT,
+                              step=0.01)
+    try:
+        time_s = parse_duration(entered)
+    except ValueError as err:
+        st.warning(str(err))
+        return
+    table = calculator_predictions(CALCULATOR_DISTANCES[distance], time_s, exponent)
+    st.dataframe(
+        table.rename(columns={"distance": "Distance", "predicted_time": "Predicted",
+                              "predicted_pace": "Pace"})[["Distance", "Predicted", "Pace"]],
+        hide_index=True, width="stretch",
+    )
+    st.caption(
+        "Enter a recent race or time trial to see what it implies at other distances. "
+        "The exponent is how much pace fades as distance grows: 1.06 is Riegel's "
+        "population fit, lower suits endurance-strong runners, higher suits speed-strong ones."
+    )
+
+
+def heart_rate_tab(data: dict) -> None:
+    activities, zones = data["activities"], data["zones"]
+    coverage = hr_coverage(activities)
+    if coverage == 0:
+        st.info("None of these runs recorded heart rate, so there are no zones to show.")
+        return
+
+    easy_share = float(zones.loc[zones["zone"] <= 2, "share"].sum())
+    cards = st.columns(3)
+    cards[0].metric("Runs with heart rate", f"{coverage:.0%}")
+    cards[1].metric("Most time in", zones.loc[zones["hours"].idxmax(), "label"])
+    cards[2].metric("Easy share (Z1-Z2)", f"{easy_share:.0%}")
+    st.caption(
+        f"Zones use heart-rate reserve between your resting ({data['hr_rest']:.0f}) and "
+        f"max ({data['hr_max']:.0f}) heart rate, set in the sidebar."
+    )
+
+    st.plotly_chart(plots.zone_distribution_figure(zones), width="stretch")
+    st.caption(
+        "How your running time splits across five effort zones, from very easy (Z1) to "
+        "all-out (Z5). Many coaches aim for roughly 80% of time in the easy zones."
+    )
+    st.plotly_chart(plots.monthly_zone_figure(data["monthly_zones"]), width="stretch")
+    st.caption("The same split month by month, so you can see hard blocks and easy phases.")
+
+    st.dataframe(
+        zones.assign(share=zones["share"].map(lambda s: f"{s:.0%}"),
+                     hours=zones["hours"].map(lambda h: f"{h:.1f}"))
+        .rename(columns={"label": "Zone", "bpm": "Heart rate (bpm)", "runs": "Runs",
+                         "hours": "Hours", "share": "Share"})
+        [["Zone", "Heart rate (bpm)", "Runs", "Hours", "Share"]],
+        hide_index=True, width="stretch",
+    )
+    st.caption(
+        "Approximation: Strava's activity summary only has each run's average heart rate, "
+        "so a whole run counts toward the zone of its average. Interval sessions are "
+        "credited to the middle zones even though they swing between easy and hard."
+    )
 
 
 def consistency_tab(data: dict) -> None:
@@ -225,7 +316,8 @@ def consistency_tab(data: dict) -> None:
 
 def main() -> None:
     path = choose_source()
-    data = build_analytics(str(path), path.stat().st_mtime)
+    hr_rest, hr_max = choose_heart_rate()
+    data = build_analytics(str(path), path.stat().st_mtime, hr_rest, hr_max)
     activities = data["activities"]
 
     st.title("Strava Run Analytics")
@@ -235,8 +327,8 @@ def main() -> None:
         f"**{activities['date'].min():%d %b %Y}** and **{activities['date'].max():%d %b %Y}**."
     )
 
-    overview, fitness, performance, consistency = st.tabs(
-        ["Overview", "Fitness & Freshness", "Performance", "Consistency"]
+    overview, fitness, performance, heart_rate, consistency = st.tabs(
+        ["Overview", "Fitness & Freshness", "Performance", "Heart rate", "Consistency"]
     )
     with overview:
         overview_tab(data)
@@ -244,6 +336,8 @@ def main() -> None:
         fitness_tab(data)
     with performance:
         performance_tab(data)
+    with heart_rate:
+        heart_rate_tab(data)
     with consistency:
         consistency_tab(data)
 

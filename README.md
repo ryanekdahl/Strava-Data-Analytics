@@ -20,9 +20,9 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has four tabs — Overview, Fitness & Freshness,
-Performance and Consistency — and a sidebar switch between the bundled sample
-data and your own export.
+Python 3.11+. The dashboard has five tabs — Overview, Fitness & Freshness,
+Performance, Heart rate and Consistency — and a sidebar with a switch between the
+bundled sample data and your own export, plus your resting and max heart rate.
 
 ## What it computes
 
@@ -30,7 +30,8 @@ data and your own export.
 |---|---|
 | **Overview** | Total distance, runs, hours and weeks tracked; current Fitness, Form and ACWR with a plain-English reading of each |
 | **Fitness & Freshness** | CTL / ATL / TSB over time, plus the exact load formula behind the curve |
-| **Performance** | Pace-vs-distance scatter with the best-effort frontier, the PR table, Riegel race predictions, recent form vs all-time best, and 30-day rolling pace and heart-rate trends |
+| **Performance** | Pace-vs-distance scatter with the best-effort frontier, the PR table, Riegel race predictions, an interactive race-time calculator, recent form vs all-time best, and 30-day rolling pace and heart-rate trends |
+| **Heart rate** | Share of time in zones Z1–Z5, monthly hours by zone, and each zone's bpm range for your heart-rate settings |
 | **Consistency** | Weekly and monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
 
 ## Methodology
@@ -132,6 +133,31 @@ Predictions are drawn from the best effort in the **last 90 days**, not the
 all-time best, so they describe current shape. The "recent form vs all-time best"
 table makes that comparison explicit.
 
+**Race-time calculator — `src/race_calculator.py`.** The same Riegel model, but
+the reference effort is one you type in (a recent race, a time trial or a goal),
+and the exponent is a slider from 1.01 to 1.15. Moving it shows how strongly a
+marathon prediction depends on that one assumed number: from a 45:00 10K, the
+marathon prediction moves from about 3:13 to 3:56 across that range.
+
+### Heart-rate zones — `src/heart_rate.py`
+
+Zones are defined on heart-rate reserve (Karvonen), the same
+`hrr = (avg_hr − hr_rest) / (hr_max − hr_rest)` scale the TRIMP term uses, so the
+sidebar's two heart-rate inputs drive both the training load and the zones:
+
+| Zone | Name | % of heart-rate reserve |
+|---|---|---|
+| Z1 | Recovery | below 60% |
+| Z2 | Aerobic | 60–70% |
+| Z3 | Tempo | 70–80% |
+| Z4 | Threshold | 80–90% |
+| Z5 | VO2 max | 90% and above |
+
+Each run's moving time is credited to the zone of its **average** heart rate,
+because `activities.csv` carries no second-by-second heart-rate stream. Shares
+are fractions of time on runs that recorded heart rate, so a forgotten strap is
+left out rather than counted as easy running.
+
 ### Consistency and workload — `src/consistency.py`
 
 Weekly and monthly volume are calendar aggregates, zero-filled so that time off
@@ -190,8 +216,13 @@ exercised by the sample rather than bypassed.
 - **Threshold pace is estimated, not tested.** It comes from the fastest decile of
   your own runs, which drifts as you get fitter. It is not a lab or field test, and
   a period of only easy running will bias it slow.
-- **`hr_rest` and `hr_max` are defaults**, not your values. The heart-rate half of
-  the load score is only as good as those two numbers.
+- **`hr_rest` and `hr_max` default to 60 and 190**, which are not your values.
+  Set yours in the sidebar: the heart-rate half of the load score and every zone
+  boundary are only as good as those two numbers.
+- **Heart-rate zones come from each run's average heart rate.** An interval
+  session averaging Z3 really swung between Z1 and Z5, so the distribution
+  understates both ends and overstates the middle. True time-in-zone needs the
+  per-activity heart-rate streams.
 - **Riegel assumes a constant fatigue exponent.** 1.06 is a population fit. It is
   pessimistic for well-trained marathoners and optimistic for beginners, and it
   cannot know whether you have done the long runs a marathon requires.
@@ -215,6 +246,8 @@ exercised by the sample rather than bypassed.
 │   ├── training_load.py        # load model, CTL / ATL / TSB
 │   ├── performance.py          # best efforts, PRs, Riegel, pace trends
 │   ├── consistency.py          # volume, streaks, ACWR
+│   ├── race_calculator.py      # parse a typed time, Riegel at any exponent
+│   ├── heart_rate.py           # HR-reserve zones, time-in-zone distribution
 │   └── plots.py                # plotly figure builders
 └── tests/                      # pytest: loader contract, load model, predictions, workload
 ```
@@ -244,3 +277,8 @@ value, best-effort selection and frontier logic. `tests/test_consistency.py`
 checks that empty weeks survive aggregation as zeroes, that streaks break on a
 rest week, and that ACWR reads 1.0 for steady training, spikes on a comeback
 week and stays undefined during a layoff rather than dividing by zero.
+`tests/test_race_calculator.py` checks time parsing (and that `5:75` is rejected
+rather than read as 6:15) and that the exponent moves predictions the right way.
+`tests/test_heart_rate.py` checks zone boundaries against hand-computed bpm,
+that runs without heart rate are excluded from shares, and that empty months
+are zero-filled.

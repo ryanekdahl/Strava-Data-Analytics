@@ -223,3 +223,41 @@ def heart_rate_figure(hr: pd.DataFrame, window_days: int = 30) -> go.Figure:
     ))
     fig.update_layout(title="Average heart rate over time")
     return _base(fig, height=340, y_title="Heart rate (bpm)")
+
+
+# Ordinal blue ramp for Z1-Z5 (light -> dark = easy -> hard); validated as one
+# hue with monotone lightness and a light end that still clears the surface.
+ZONE_COLORS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
+
+
+def zone_distribution_figure(zones: pd.DataFrame) -> go.Figure:
+    """Share of heart-rate-recorded time per zone, one bar per zone."""
+    fig = go.Figure(go.Bar(
+        x=zones["label"], y=zones["share"] * 100.0,
+        marker=dict(color=ZONE_COLORS[:len(zones)], cornerradius=4),
+        customdata=np.stack([zones["bpm"], zones["hours"], zones["runs"]], axis=-1),
+        text=[f"{share:.0%}" for share in zones["share"]], textposition="outside",
+        textfont=dict(color=INK_SECONDARY),
+        hovertemplate=("%{x} (%{customdata[0]} bpm)<br>%{y:.0f}% of time, "
+                       "%{customdata[1]:.1f} h over %{customdata[2]} runs<extra></extra>"),
+    ))
+    fig.update_layout(title="Time in heart-rate zone", showlegend=False,
+                      hovermode="closest", bargap=0.25)
+    _base(fig, height=360, y_title="Share of time (%)")
+    fig.update_yaxes(range=[0, max(float(zones["share"].max()) * 115.0, 10.0)])
+    return fig
+
+
+def monthly_zone_figure(monthly: pd.DataFrame) -> go.Figure:
+    """Hours per zone per month, stacked easy-at-the-bottom."""
+    fig = go.Figure()
+    for color, (_, frame) in zip(ZONE_COLORS, monthly.groupby("zone", sort=True)):
+        name = frame["label"].iloc[0]
+        fig.add_trace(go.Bar(
+            x=frame["month_start"], y=frame["hours"], name=name,
+            marker=dict(color=color, line=dict(width=2, color=SURFACE)),
+            hovertemplate=f"{name}: %{{y:.1f}} h<extra></extra>",
+        ))
+    fig.update_layout(title="Monthly hours by zone", barmode="stack", bargap=0.2)
+    fig.update_xaxes(hoverformat="%b %Y")
+    return _base(fig, height=380, y_title="Hours")
