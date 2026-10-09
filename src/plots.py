@@ -171,6 +171,31 @@ def weekly_volume_figure(weekly: pd.DataFrame) -> go.Figure:
     return _volume_figure(weekly, "week_start", "Weekly distance", "Week of %{x|%d %b %Y}")
 
 
+def weekly_hours_figure(weekly: pd.DataFrame) -> go.Figure:
+    """Moving time per calendar week, in hours."""
+    fig = go.Figure(go.Bar(
+        x=weekly["week_start"], y=weekly["moving_time_h"],
+        marker=dict(color=SERIES["fitness"], cornerradius=4), customdata=weekly["runs"],
+        hovertemplate=("Week of %{x|%d %b %Y}<br>%{y:.1f} h over %{customdata} runs"
+                       "<extra></extra>"),
+    ))
+    fig.update_layout(title="Hours run per week", bargap=0.25)
+    return _base(fig, height=320, y_title="Hours")
+
+
+def weekly_runs_figure(weekly: pd.DataFrame) -> go.Figure:
+    """Number of runs per calendar week."""
+    fig = go.Figure(go.Bar(
+        x=weekly["week_start"], y=weekly["runs"],
+        marker=dict(color=SERIES["fitness"], cornerradius=4),
+        hovertemplate="Week of %{x|%d %b %Y}<br>%{y:.0f} runs<extra></extra>",
+    ))
+    fig.update_layout(title="Runs per week", bargap=0.25)
+    _base(fig, height=320, y_title="Runs")
+    fig.update_yaxes(dtick=1)
+    return fig
+
+
 def monthly_volume_figure(monthly: pd.DataFrame) -> go.Figure:
     """Distance per calendar month."""
     return _volume_figure(monthly, "month_start", "Monthly distance", "%{x|%b %Y}")
@@ -261,3 +286,47 @@ def monthly_zone_figure(monthly: pd.DataFrame) -> go.Figure:
     fig.update_layout(title="Monthly hours by zone", barmode="stack", bargap=0.2)
     fig.update_xaxes(hoverformat="%b %Y")
     return _base(fig, height=380, y_title="Hours")
+
+
+def recovery_timeline_figure(
+    joined: pd.DataFrame, column: str, baseline: pd.Series, title: str, y_title: str
+) -> go.Figure:
+    """Nightly sleep score or HRV as dots, with a trailing 7-day baseline line."""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=joined["date"], y=joined[column], name="Nightly", mode="markers",
+        marker=dict(color=MUTED, size=7, opacity=0.5, line=dict(width=1, color=SURFACE)),
+        hovertemplate="%{y:.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=joined["date"], y=baseline, name="7-day average", mode="lines",
+        line=dict(color=SERIES["fitness"], width=2),
+        hovertemplate="%{y:.1f} average<extra></extra>",
+    ))
+    fig.update_layout(title=title)
+    fig.update_xaxes(hoverformat="%d %b %Y")
+    return _base(fig, height=340, y_title=y_title)
+
+
+def recovery_scatter_figure(
+    joined: pd.DataFrame, x: str, y: str, x_title: str, y_title: str, r: float
+) -> go.Figure:
+    """One dot per day, training metric vs recovery metric, with a least-squares line."""
+    pair = joined[["date", x, y]].dropna()
+    fig = go.Figure(go.Scatter(
+        x=pair[x], y=pair[y], name="Day", mode="markers",
+        marker=dict(color=MUTED, size=8, opacity=0.55, line=dict(width=1, color=SURFACE)),
+        customdata=pair["date"].dt.strftime("%d %b %Y"),
+        hovertemplate="%{customdata}<br>%{x:.0f} -> %{y:.0f}<extra></extra>",
+    ))
+    if len(pair) >= 2 and pair[x].std() > 0:
+        slope, intercept = np.polyfit(pair[x], pair[y], 1)
+        xs = np.array([pair[x].min(), pair[x].max()])
+        fig.add_trace(go.Scatter(
+            x=xs, y=slope * xs + intercept, name="Trend", mode="lines",
+            line=dict(color=SERIES["fitness"], width=2), hoverinfo="skip",
+        ))
+    r_text = f"r = {r:+.2f}" if np.isfinite(r) else "r not available"
+    fig.update_layout(title=f"{y_title} vs {x_title.lower()} ({r_text}, {len(pair)} days)",
+                      hovermode="closest", showlegend=False)
+    return _base(fig, height=400, y_title=y_title, x_title=x_title)

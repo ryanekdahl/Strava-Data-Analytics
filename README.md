@@ -20,8 +20,8 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has five tabs — Overview, Fitness & Freshness,
-Performance, Heart rate and Consistency — and a sidebar with a switch between the
+Python 3.11+. The dashboard has six tabs — Overview, Fitness & Freshness,
+Performance, Heart rate, Consistency and Sleep & HRV — and a sidebar with a switch between the
 bundled sample data and your own export, plus your resting and max heart rate.
 
 ## What it computes
@@ -32,7 +32,8 @@ bundled sample data and your own export, plus your resting and max heart rate.
 | **Fitness & Freshness** | CTL / ATL / TSB over time, plus the exact load formula behind the curve |
 | **Performance** | Pace-vs-distance scatter with the best-effort frontier, the PR table, Riegel race predictions, an interactive race-time calculator, recent form vs all-time best, and 30-day rolling pace and heart-rate trends |
 | **Heart rate** | Share of time in zones Z1–Z5, monthly hours by zone, and each zone's bpm range for your heart-rate settings |
-| **Consistency** | Weekly and monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
+| **Consistency** | Weekly distance, hours and run counts, monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
+| **Sleep & HRV** | Import a sleep-score / HRV CSV (Whoop, Oura, Garmin or the template) and see how each morning's reading correlates with the previous day's load, Fatigue and Form — see `src/recovery.py` |
 
 ## Methodology
 

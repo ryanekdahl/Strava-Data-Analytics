@@ -27,6 +27,10 @@ from src.performance import (
     RIEGEL_EXPONENT, best_effort_frontier, best_recent_effort, format_duration, format_pace,
     personal_records, predict_races, recent_vs_all_time, rolling_hr, rolling_pace,
 )
+from src.recovery import (
+    RECOVERY_CSV, RECOVERY_METRICS, TEMPLATE_CSV, TRAINING_METRICS, correlation_table,
+    join_recovery, load_recovery, rolling_baseline, synthetic_recovery,
+)
 from src.race_calculator import (
     CALCULATOR_DISTANCES, EXPONENT_RANGE, calculator_predictions, parse_duration,
 )
@@ -60,6 +64,12 @@ def build_analytics(path: str, _mtime: float, hr_rest: float, hr_max: float) -> 
         "hr_rest": hr_rest,
         "hr_max": hr_max,
     }
+
+
+@st.cache_data(show_spinner=False)
+def read_recovery(content: bytes) -> pd.DataFrame:
+    """Parse a sleep/HRV CSV once per distinct file contents."""
+    return load_recovery(content)
 
 
 def choose_source() -> Path:
@@ -298,8 +308,28 @@ def consistency_tab(data: dict) -> None:
                     if not weekly.empty else "--")
     st.caption("A streak is consecutive calendar weeks containing at least one run.")
 
+    time_cards = st.columns(4)
+    time_cards[0].metric("Typical week (time)", f"{active['moving_time_h'].median():.1f} h"
+                         if not active.empty else "--")
+    time_cards[1].metric("Typical week (runs)", f"{active['runs'].median():.0f} runs"
+                         if not active.empty else "--")
+    time_cards[2].metric("Average per week", f"{weekly['moving_time_h'].mean():.1f} h"
+                         if not weekly.empty else "--")
+    time_cards[3].metric("Average runs per week", f"{weekly['runs'].mean():.1f}"
+                         if not weekly.empty else "--")
+    st.caption("Typical is the median over weeks with at least one run; averages include "
+               "empty weeks, so breaks pull them down.")
+
     st.plotly_chart(plots.weekly_volume_figure(weekly), width="stretch")
     st.caption("Distance run each calendar week. Empty weeks are shown as gaps, not skipped.")
+
+    hours_col, runs_col = st.columns(2)
+    with hours_col:
+        st.plotly_chart(plots.weekly_hours_figure(weekly), width="stretch")
+        st.caption("Moving time per calendar week.")
+    with runs_col:
+        st.plotly_chart(plots.weekly_runs_figure(weekly), width="stretch")
+        st.caption("Number of runs per calendar week.")
 
     st.plotly_chart(plots.monthly_volume_figure(data["monthly"]), width="stretch")
     st.caption("The same volume rolled up by month, which smooths out single-week noise.")
@@ -312,6 +342,108 @@ def consistency_tab(data: dict) -> None:
         f"sustainably; well above it you are ramping faster than your body is adapting, "
         f"which is the classic injury-risk pattern."
     )
+
+
+def recovery_tab(data: dict, is_sample: bool) -> None:
+    uploaded = None
+    has_saved = RECOVERY_CSV.is_file()
+    with st.expander("Import sleep & HRV data", expanded=not has_saved):
+        uploaded = st.file_uploader("Sleep score / HRV CSV", type="csv")
+        st.markdown(
+            "Any CSV with a **date** column and a **sleep score** and/or **HRV (ms)** "
+            "column works -- names are matched loosely, so exports from Whoop, Oura or "
+            "Garmin usually load as-is. Each date is the morning the reading describes. "
+            "To skip uploading every session, save the file as `data/raw/recovery.csv`."
+        )
+        st.download_button("Download a template", TEMPLATE_CSV, "recovery_template.csv",
+                           mime="text/csv")
+
+    if uploaded is not None:
+        content, origin = uploaded.getvalue(), f"uploaded file `{uploaded.name}`"
+    elif has_saved:
+        content, origin = RECOVERY_CSV.read_bytes(), "`data/raw/recovery.csv`"
+    else:
+        content, origin = None, None
+
+    if content is not None:
+        try:
+            recovery = read_recovery(content)
+        except (ValueError, pd.errors.ParserError, UnicodeDecodeError) as err:
+            st.error(f"Could not read {origin}: {err}")
+            return
+    elif is_sample:
+        recovery = synthetic_recovery(data["fitness"])
+        origin = "synthetic sleep and HRV data generated to match the sample runs"
+    else:
+        st.info("Upload a sleep score / HRV file above to see how it lines up with "
+                "your training.")
+        return
+
+    joined = join_recovery(recovery, data["fitness"])
+    if joined.empty:
+        st.warning(
+            f"None of the {len(recovery):,} days in the recovery file fall inside your "
+            f"training history ({data['activities']['date'].min():%d %b %Y} -- "
+            f"{data['activities']['date'].max():%d %b %Y})."
+        )
+        return
+    available = [key for key in RECOVERY_METRICS if joined[key].notna().any()]
+    table = correlation_table(joined)
+    st.caption(f"Using {origin}: {len(joined):,} days overlap with your runs.")
+
+    cards = st.columns(4)
+    cards[0].metric("Days matched", f"{len(joined):,}")
+    cards[1].metric("Average sleep score", f"{joined['sleep_score'].mean():.0f}"
+                    if "sleep_score" in available else "--")
+    cards[2].metric("Average HRV", f"{joined['hrv_ms'].mean():.0f} ms"
+                    if "hrv_ms" in available else "--")
+    ranked = table.dropna(subset=["r"])
+    if not ranked.empty:
+        top = ranked.loc[ranked["r"].abs().idxmax()]
+        cards[3].metric("Strongest link", f"r = {top['r']:+.2f}",
+                        delta=f"{top['recovery_label']} vs {top['training_label'].lower()}",
+                        delta_color="off")
+    else:
+        cards[3].metric("Strongest link", "--")
+
+    st.subheader("How training lines up with recovery")
+    st.dataframe(
+        table.rename(columns={"recovery_label": "Recovery", "training_label": "Training",
+                              "n": "Days", "strength": "Reading"})
+        [["Recovery", "Training", "r", "Days", "Reading"]],
+        hide_index=True, width="stretch",
+        column_config={"r": st.column_config.NumberColumn("r", format="%+.2f")},
+    )
+    st.caption(
+        "Pearson correlation: -1 means one always falls as the other rises, 0 means no "
+        "straight-line link, +1 means they rise together. A negative r between yesterday's "
+        "load and HRV is the classic pattern -- hard days suppress the next morning's HRV. "
+        "Correlation is not cause, and with fewer than a few months of data, r swings a lot."
+    )
+
+    if available:
+        left, right = st.columns(2)
+        recovery_key = left.selectbox("Recovery metric", available,
+                                      format_func=RECOVERY_METRICS.get)
+        training_key = right.selectbox("Training metric", list(TRAINING_METRICS),
+                                       format_func=TRAINING_METRICS.get)
+        r = table.set_index(["recovery", "training"]).loc[(recovery_key, training_key), "r"]
+        st.plotly_chart(plots.recovery_scatter_figure(
+            joined, training_key, recovery_key, TRAINING_METRICS[training_key],
+            RECOVERY_METRICS[recovery_key], float(r)), width="stretch")
+        st.caption("Each dot is one morning's reading against the training metric for "
+                   "that day; the line is the least-squares trend.")
+
+        columns = st.columns(len(available))
+        titles = {"sleep_score": ("Sleep score", "Score"), "hrv_ms": ("Overnight HRV", "HRV (ms)")}
+        for column, key in zip(columns, available):
+            with column:
+                title, y_title = titles[key]
+                st.plotly_chart(plots.recovery_timeline_figure(
+                    joined, key, rolling_baseline(joined, key), title, y_title),
+                    width="stretch")
+        st.caption("Nightly readings with a trailing 7-day average. Trends in the average "
+                   "matter more than any single night.")
 
 
 def main() -> None:
@@ -327,8 +459,9 @@ def main() -> None:
         f"**{activities['date'].min():%d %b %Y}** and **{activities['date'].max():%d %b %Y}**."
     )
 
-    overview, fitness, performance, heart_rate, consistency = st.tabs(
-        ["Overview", "Fitness & Freshness", "Performance", "Heart rate", "Consistency"]
+    overview, fitness, performance, heart_rate, consistency, recovery = st.tabs(
+        ["Overview", "Fitness & Freshness", "Performance", "Heart rate", "Consistency",
+         "Sleep & HRV"]
     )
     with overview:
         overview_tab(data)
@@ -340,6 +473,8 @@ def main() -> None:
         heart_rate_tab(data)
     with consistency:
         consistency_tab(data)
+    with recovery:
+        recovery_tab(data, is_sample=path == SAMPLE_CSV)
 
 
 if __name__ == "__main__":

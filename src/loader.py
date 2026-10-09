@@ -199,11 +199,16 @@ def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
 
 
 def find_real_export(raw_dir: str | Path = RAW_DIR) -> Path | None:
-    """Return the user's own ``activities.csv`` in ``data/raw/``, if present."""
+    """Return the user's own ``activities.csv`` in ``data/raw/``, if present.
+
+    ``recovery.csv`` (sleep/HRV, see :mod:`src.recovery`) shares the folder and
+    is never mistaken for a Strava export.
+    """
     raw_dir = Path(raw_dir)
     if not raw_dir.is_dir():
         return None
     preferred = raw_dir / "activities.csv"
     if preferred.is_file():
         return preferred
-    return next(iter(sorted(raw_dir.glob("*.csv"))), None)
+    others = (path for path in sorted(raw_dir.glob("*.csv")) if path.name != "recovery.csv")
+    return next(others, None)
