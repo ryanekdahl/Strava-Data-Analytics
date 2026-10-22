@@ -19,8 +19,13 @@ Z5    VO2 max        90% and above
 heart rate per run, not a second-by-second stream, so each run's whole moving
 time is credited to the zone of its average.  A run of intervals averaging Z3
 really spent its time split between Z1 and Z5; this distribution therefore
-understates both ends and overstates the middle.  True time-in-zone needs the
-per-activity HR streams.
+understates both ends and overstates the middle.
+
+**True time in zone** comes from the GPS recordings when they are in the export:
+:mod:`src.streams` stores how many seconds each run spent at every whole-number
+heart rate, and :func:`stream_zone_distribution` credits each of those seconds
+to its own zone.  Both functions return the same columns, so the dashboard can
+show either -- or both side by side.
 """
 
 from __future__ import annotations
@@ -132,3 +137,55 @@ def hr_coverage(activities: pd.DataFrame) -> float:
     if activities.empty:
         return 0.0
     return float(activities["avg_hr"].notna().mean())
+
+
+def _stream_zones(hr_seconds: pd.DataFrame, hr_rest: float, hr_max: float) -> pd.DataFrame:
+    """The per-bpm histogram rows with each bpm's zone attached."""
+    zones = assign_zone(hr_seconds["bpm"].astype("float64"), hr_rest, hr_max)
+    return hr_seconds.assign(zone=zones.astype(int))
+
+
+def stream_zone_distribution(
+    hr_seconds: pd.DataFrame, hr_rest: float = DEFAULT_HR_REST, hr_max: float = DEFAULT_HR_MAX
+) -> pd.DataFrame:
+    """True time in zone from second-by-second heart rate.
+
+    ``hr_seconds`` is :attr:`src.streams.StreamData.hr_seconds`.  Returns the
+    same ``DataFrame[zone, label, bpm, runs, hours, share]`` as
+    :func:`zone_distribution`; ``runs`` counts runs that touched the zone.
+    """
+    table = zone_table(hr_rest, hr_max)
+    if hr_seconds.empty:
+        return table.assign(runs=0, hours=0.0, share=0.0)
+    zoned = _stream_zones(hr_seconds, hr_rest, hr_max)
+    grouped = zoned.groupby("zone").agg(
+        runs=("activity_id", "nunique"), hours=("seconds", lambda s: s.sum() / 3600.0))
+    result = table.join(grouped, on="zone")
+    result["runs"] = result["runs"].fillna(0).astype(int)
+    result["hours"] = result["hours"].fillna(0.0)
+    total = result["hours"].sum()
+    result["share"] = result["hours"] / total if total > 0 else 0.0
+    return result
+
+
+def stream_monthly_zone_hours(
+    hr_seconds: pd.DataFrame, hr_rest: float = DEFAULT_HR_REST, hr_max: float = DEFAULT_HR_MAX
+) -> pd.DataFrame:
+    """Monthly hours per zone from second-by-second heart rate.
+
+    Same long-form ``DataFrame[month_start, zone, label, hours]`` as
+    :func:`monthly_zone_hours`, zero-filled over a gap-free month index.
+    """
+    columns = ["month_start", "zone", "label", "hours"]
+    if hr_seconds.empty:
+        return pd.DataFrame(columns=columns)
+    zoned = _stream_zones(hr_seconds, hr_rest, hr_max)
+    months = zoned["date"].dt.to_period("M").dt.to_timestamp()
+    hours = zoned.groupby([months, "zone"])["seconds"].sum() / 3600.0
+    calendar = pd.date_range(months.min(), months.max(), freq="MS")
+    grid = pd.MultiIndex.from_product([calendar, [zone for zone, _, _ in ZONES]],
+                                      names=["month_start", "zone"])
+    frame = hours.reindex(grid, fill_value=0.0).rename("hours").reset_index()
+    labels = zone_table(hr_rest, hr_max).set_index("zone")["label"]
+    frame["label"] = frame["zone"].map(labels)
+    return frame[columns]

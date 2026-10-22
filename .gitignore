@@ -6,3 +6,5 @@ __pycache__/
 data/raw/*
 !data/raw/.gitkeep
 data/sample/*.csv
+data/sample/activities/
+data/sample/.stream_cache/

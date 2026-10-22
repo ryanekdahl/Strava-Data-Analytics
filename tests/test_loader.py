@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from src.generate_sample import generate_sample
-from src.loader import CONTRACT_COLUMNS, find_real_export, load_activities
+from src.loader import CONTRACT_COLUMNS, TIDY_COLUMNS, find_real_export, load_activities
 
 HEADER = ("Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,"
           "Distance,Moving Time,Average Heart Rate,Elevation Gain\n")
@@ -18,7 +18,7 @@ HEADER = ("Activity ID,Activity Date,Activity Name,Activity Type,Elapsed Time,"
 def sample_csv(tmp_path_factory) -> object:
     """A freshly generated synthetic export, independent of ``data/sample``."""
     path = tmp_path_factory.mktemp("sample") / "activities.csv"
-    generate_sample(path, seed=1234)
+    generate_sample(path, seed=1234, write_streams=False)
     return path
 
 
@@ -33,7 +33,8 @@ def write_csv(path, rows: list[str]):
 
 
 def test_synthetic_csv_loads_and_has_the_contract_columns(sample_runs):
-    assert list(sample_runs.columns) == CONTRACT_COLUMNS
+    assert list(sample_runs.columns) == TIDY_COLUMNS
+    assert TIDY_COLUMNS[:len(CONTRACT_COLUMNS)] == CONTRACT_COLUMNS
     assert len(sample_runs) > 200  # ~16 months at ~4 runs/week
 
 
@@ -123,8 +124,11 @@ def test_missing_optional_columns_still_satisfy_the_contract(tmp_path):
     )
     runs = load_activities(path)
 
-    assert list(runs.columns) == CONTRACT_COLUMNS
+    assert list(runs.columns) == TIDY_COLUMNS
     assert runs["avg_hr"].isna().all()
+    for column in ("max_hr", "avg_cadence_spm", "gap_pace_min_per_km", "relative_effort",
+                   "gear", "filename"):
+        assert runs[column].isna().all(), column
     assert runs["elevation_gain_m"].isna().all()
     # With no moving-time column, elapsed time stands in for it.
     assert runs["moving_time_s"].iloc[0] == 3000
@@ -143,3 +147,51 @@ def test_find_real_export(tmp_path):
     assert find_real_export(tmp_path).name == "other.csv"
     (tmp_path / "activities.csv").write_text("x\n")
     assert find_real_export(tmp_path).name == "activities.csv"
+
+
+EXTRA_HEADER = ("Activity ID,Activity Date,Activity Type,Distance,Moving Time,"
+                "Max Heart Rate,Average Cadence,Grade Adjusted Distance,Relative Effort,"
+                "Activity Gear,Filename\n")
+
+
+def test_extra_export_columns_are_parsed(tmp_path):
+    path = tmp_path / "activities.csv"
+    path.write_text(EXTRA_HEADER + "".join([
+        '1,"Jan 01, 2024, 7:00:00 AM",Run,10000,3000,171,84.5,10500,62,Pegasus 40,'
+        'activities/1.fit.gz\n',
+        '2,"Jan 02, 2024, 7:00:00 AM",Run,10000,3000,,86.0,,,,\n',
+    ]))
+    runs = load_activities(path)
+
+    first, second = runs.iloc[0], runs.iloc[1]
+    assert first["max_hr"] == 171
+    assert first["avg_cadence_spm"] == pytest.approx(169.0)  # per-leg value doubled
+    # 50 minutes over 10.5 grade-adjusted km.
+    assert first["gap_pace_min_per_km"] == pytest.approx(50.0 / 10.5)
+    assert first["relative_effort"] == 62
+    assert first["gear"] == "Pegasus 40"
+    assert first["filename"] == "activities/1.fit.gz"
+    assert pd.isna(second["gap_pace_min_per_km"])
+    assert pd.isna(second["gear"]) and pd.isna(second["filename"])  # blanks become missing
+
+
+def test_cadence_already_in_steps_per_minute_is_left_alone(tmp_path):
+    path = tmp_path / "activities.csv"
+    path.write_text(EXTRA_HEADER
+                    + '1,"Jan 01, 2024, 7:00:00 AM",Run,10000,3000,,172,,,,\n')
+    assert load_activities(path)["avg_cadence_spm"].iloc[0] == pytest.approx(172.0)
+
+
+def test_implausible_grade_adjusted_distance_is_ignored(tmp_path):
+    path = tmp_path / "activities.csv"
+    path.write_text(EXTRA_HEADER
+                    + '1,"Jan 01, 2024, 7:00:00 AM",Run,10000,3000,,,30000,,,\n')
+    assert pd.isna(load_activities(path)["gap_pace_min_per_km"].iloc[0])
+
+
+def test_synthetic_sample_carries_the_extra_columns(sample_runs):
+    assert sample_runs["filename"].notna().all()
+    assert sample_runs["gear"].notna().mean() > 0.9
+    assert sample_runs["avg_cadence_spm"].between(140, 200).all()
+    # Hills make grade-adjusted pace faster than raw pace, never slower.
+    assert (sample_runs["gap_pace_min_per_km"] <= sample_runs["pace_min_per_km"]).all()

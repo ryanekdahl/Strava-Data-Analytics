@@ -20,6 +20,20 @@ The contract produced by :func:`load_activities` is one row per run with:
 ``avg_hr``           float, nullable
 ``elevation_gain_m`` float, nullable
 ===================  =========================================================
+
+Recent exports carry far more than that, so the frame also has these *extra*
+columns.  Every one is always present and simply empty when the export lacks it:
+
+=======================  =====================================================
+``max_hr``               float -- highest heart rate recorded on the run
+``avg_cadence_spm``      float -- steps per minute (per-leg values are doubled)
+``gap_pace_min_per_km``  float -- grade-adjusted pace, from Strava's
+                         ``Grade Adjusted Distance``
+``relative_effort``      float -- Strava's own Relative Effort score
+``gear``                 str, nullable -- the shoe the run was logged with
+``filename``             str, nullable -- path of the run's GPS file inside the
+                         export, e.g. ``activities/123.fit.gz``
+=======================  =====================================================
 """
 
 from __future__ import annotations
@@ -48,6 +62,17 @@ CONTRACT_COLUMNS = [
     "elevation_gain_m",
 ]
 
+EXTRA_COLUMNS = [
+    "max_hr",
+    "avg_cadence_spm",
+    "gap_pace_min_per_km",
+    "relative_effort",
+    "gear",
+    "filename",
+]
+
+TIDY_COLUMNS = CONTRACT_COLUMNS + EXTRA_COLUMNS
+
 # Candidate source columns, most trustworthy first.  Strava repeats "Distance";
 # the duplicate (read as "Distance.1") is the meters column, so prefer it.
 _CANDIDATES = {
@@ -60,11 +85,25 @@ _CANDIDATES = {
     "elapsed_time": ("Elapsed Time", "Elapsed Time.1", "elapsed_time_s", "elapsed_time"),
     "avg_hr": ("Average Heart Rate", "Average Heart Rate.1", "avg_hr", "average_heartrate"),
     "elevation_gain": ("Elevation Gain", "Elevation Gain.1", "elevation_gain_m", "total_elevation_gain"),
+    "max_hr": ("Max Heart Rate.1", "Max Heart Rate", "max_hr", "max_heartrate"),
+    "cadence": ("Average Cadence", "avg_cadence_spm", "average_cadence"),
+    "grade_adjusted_distance": ("Grade Adjusted Distance", "grade_adjusted_distance"),
+    "relative_effort": ("Relative Effort.1", "Relative Effort", "relative_effort", "suffer_score"),
+    "gear": ("Activity Gear", "gear"),
+    "filename": ("Filename", "filename"),
 }
 
 # A distance series whose typical value exceeds this is read as meters, not km.
 # No sane run is 300 km, and no sane run is 300 m, so the gap is unambiguous.
 _METERS_THRESHOLD = 300.0
+
+# Strava and most watches log running cadence per leg (~80-95); a typical
+# value below this is doubled to steps per minute, where 150-190 is normal.
+_PER_LEG_CADENCE_THRESHOLD = 120.0
+
+# Grade-adjusted pace further than this from flat pace is treated as a bad
+# value: even a mountain run rarely moves its flat-equivalent pace by 40%.
+_GAP_RATIO_LIMITS = (0.6, 1.4)
 
 
 def _pick(frame: pd.DataFrame, key: str) -> pd.Series | None:
@@ -106,6 +145,22 @@ def _to_kilometers(series: pd.Series) -> pd.Series:
     if not positive.empty and positive.median() > _METERS_THRESHOLD:
         return series / 1000.0
     return series
+
+
+def _to_steps_per_minute(series: pd.Series) -> pd.Series:
+    """Normalize cadence to steps per minute, inferring per-leg values from magnitude."""
+    positive = series[series > 0]
+    if not positive.empty and positive.median() < _PER_LEG_CADENCE_THRESHOLD:
+        series = series * 2.0
+    return series.where(series > 0)
+
+
+def _optional_text(series: pd.Series | None, index: pd.Index) -> pd.Series:
+    """A text column with blanks turned into missing values."""
+    if series is None:
+        return pd.Series(pd.NA, index=index, dtype="string")
+    text = series.astype("string").str.strip()
+    return text.mask(text == "")
 
 
 def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
@@ -158,6 +213,10 @@ def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
     nan_column = pd.Series(np.nan, index=raw.index, dtype="float64")
     avg_hr = _coerce_numeric(_pick(raw, "avg_hr"))
     elevation_gain_m = _coerce_numeric(_pick(raw, "elevation_gain"))
+    max_hr = _coerce_numeric(_pick(raw, "max_hr"))
+    cadence = _coerce_numeric(_pick(raw, "cadence"))
+    grade_adjusted = _coerce_numeric(_pick(raw, "grade_adjusted_distance"))
+    relative_effort = _coerce_numeric(_pick(raw, "relative_effort"))
 
     tidy = pd.DataFrame(
         {
@@ -169,6 +228,13 @@ def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
             "elapsed_time_s": elapsed_time_s,
             "avg_hr": nan_column if avg_hr is None else avg_hr,
             "elevation_gain_m": nan_column if elevation_gain_m is None else elevation_gain_m,
+            "max_hr": nan_column if max_hr is None else max_hr,
+            "avg_cadence_spm": nan_column if cadence is None else _to_steps_per_minute(cadence),
+            "grade_adjusted_km": (nan_column if grade_adjusted is None
+                                  else _to_kilometers(grade_adjusted)),
+            "relative_effort": nan_column if relative_effort is None else relative_effort,
+            "gear": _optional_text(_pick(raw, "gear"), raw.index),
+            "filename": _optional_text(_pick(raw, "filename"), raw.index),
         }
     )
 
@@ -194,8 +260,18 @@ def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
     )
     tidy["pace_min_per_km"] = (tidy["moving_time_s"] / 60.0) / tidy["distance_km"]
 
+    # Grade-adjusted pace: the same moving time spread over Strava's
+    # flat-equivalent distance, so a hilly run reads faster than its raw pace.
+    gap = (tidy["moving_time_s"] / 60.0) / tidy["grade_adjusted_km"].where(
+        tidy["grade_adjusted_km"] > 0)
+    low, high = _GAP_RATIO_LIMITS
+    tidy["gap_pace_min_per_km"] = gap.where(
+        (gap / tidy["pace_min_per_km"]).between(low, high)).astype("float64")
+    for column in ("max_hr", "avg_cadence_spm", "relative_effort"):
+        tidy[column] = tidy[column].astype("float64")
+
     tidy = tidy.sort_values("date").reset_index(drop=True)
-    return tidy[CONTRACT_COLUMNS]
+    return tidy[TIDY_COLUMNS]
 
 
 def find_real_export(raw_dir: str | Path = RAW_DIR) -> Path | None:

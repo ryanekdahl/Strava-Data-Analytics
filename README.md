@@ -4,9 +4,12 @@ Strava puts its most interesting running analytics behind a paywall: **Fitness &
 Freshness**, best-effort curves and race-time predictions. This project rebuilds
 all three from a plain Strava data export using a training-load model that is
 written down in full rather than hidden — every number on the dashboard traces
-back to a formula in this README and a function in `src/`. It ships with a
-synthetic 16-month training history, so the dashboard is populated and
-interactive the moment you start it, with no account and no API keys.
+back to a formula in this README and a function in `src/`. It then goes further
+than Strava does, by fitting the model's textbook constants to *your* data: a
+personal Riegel exponent and personal Fitness and Fatigue time constants, each
+with an interval saying how sure the estimate is. It ships with a synthetic
+16-month training history, GPS recordings included, so the dashboard is populated
+and interactive the moment you start it, with no account and no API keys.
 
 ![dashboard](docs/screenshot.png)
 
@@ -15,24 +18,30 @@ interactive the moment you start it, with no account and no API keys.
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python -m src.generate_sample        # writes data/sample/activities.csv
+python -m src.generate_sample        # writes data/sample/activities.csv + GPS files
 pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has six tabs — Overview, Fitness & Freshness,
-Performance, Heart rate, Consistency and Sleep & HRV — and a sidebar with a switch between the
-bundled sample data and your own export, plus your resting and max heart rate.
+Python 3.11+. The dashboard has nine tabs — Overview, Fitness & Freshness,
+Performance, Heart rate, Consistency, Run detail, Personal models, Gear and Sleep & HRV —
+and a sidebar with a switch between the bundled sample data and your own export, a
+**period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
+custom range), **kilometres or miles**, your resting and max heart rate, and a choice
+between the standard and your fitted Fitness time constants.
 
 ## What it computes
 
 | Tab | What you get |
 |---|---|
 | **Overview** | Total distance, runs, hours and weeks tracked; current Fitness, Form and ACWR with a plain-English reading of each |
-| **Fitness & Freshness** | CTL / ATL / TSB over time, plus the exact load formula behind the curve |
-| **Performance** | Pace-vs-distance scatter with the best-effort frontier, the PR table, Riegel race predictions, an interactive race-time calculator, recent form vs all-time best, and 30-day rolling pace and heart-rate trends |
-| **Heart rate** | Share of time in zones Z1–Z5, monthly hours by zone, and each zone's bpm range for your heart-rate settings |
+| **Fitness & Freshness** | CTL / ATL / TSB over time (standard or fitted time constants), the exact load formula behind the curve, and a check of the load score against Strava's own Relative Effort |
+| **Performance** | Pace-vs-distance scatter with the best-effort frontier; true in-run best efforts and a pace curve from the GPS files; the PR table; Riegel race predictions with the standard or your fitted exponent; an interactive race-time calculator; recent form vs all-time best; and 30-day rolling pace and heart-rate trends |
+| **Heart rate** | Share of time in zones Z1–Z5 — second by second when the GPS files are present, compared against the average-HR shortcut — monthly hours by zone, and each zone's bpm range |
 | **Consistency** | Weekly distance, hours and run counts, monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
+| **Run detail** | Any run's route coloured by pace or heart rate, its per-kilometre (or per-mile) pace, heart rate, cadence and elevation, and its aerobic decoupling |
+| **Personal models** | Your own Riegel exponent with a 95% interval, and Banister fitness–fatigue time constants fitted to your runs, with a bootstrap interval, the fit surface, and what one hard session does day by day |
+| **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 | **Sleep & HRV** | Import a sleep-score / HRV CSV (Whoop, Oura, Garmin or the template) and see how each morning's reading correlates with the previous day's load, Fatigue and Form — see `src/recovery.py` |
 
 ## Methodology
@@ -108,6 +117,136 @@ is the balance you finished yesterday with.
 Reading the chart: Form above roughly +5 means rested and race-ready, around zero
 means steady training, and deeply negative means a productive overload block that
 needs to end soon.
+
+### What the export carries beyond the basics — `src/loader.py`
+
+Recent exports have dozens of columns. The loader keeps the ones the dashboard uses,
+each present (and simply empty) whatever the export's vintage: **max heart rate**
+(the sidebar flags a recorded value above your Max HR setting), **cadence** (logged
+per leg, so a typical value under 120 is doubled to steps per minute), **Strava's
+Relative Effort**, the **shoe** each run was logged in, the **filename** of its GPS
+recording, and **grade-adjusted pace** — moving time over Strava's *Grade Adjusted
+Distance*, discarded if it is more than 40% away from flat pace.
+
+Grade-adjusted pace replaces raw pace in the load model wherever it exists, for both
+the intensity factor and the threshold estimate, so a slow climb is scored as the hard
+work it is rather than as an easy jog.
+
+**Checking the load model against Strava's.** With Relative Effort in the export, the
+Fitness tab plots this project's load score against it, run by run. The two are on
+different scales by design, so the meaningful number is Spearman's rank correlation:
+whether the transparent model puts your sessions in the same order as Strava's
+proprietary one.
+
+### GPS recordings — `src/streams.py`
+
+A Strava archive also holds the recording of every activity in its `activities/`
+folder (`.gpx`, `.tcx` or `.fit`, usually gzipped). Each is reduced once to a small
+JSON summary in a `.stream_cache` folder beside the export, named after the source
+file's size and modification time, so later page loads only check that a file
+exists. Unreadable files are cached as failures and reported, never fatal.
+
+**Moving time.** Pace in `activities.csv` is moving time over distance, so every
+stream computation runs on a moving clock too. A step slower than 0.5 m/s is a stop,
+credited only with the time its few metres would take at the run's median speed — a
+pause logged as one long gap between two fixes costs no more than the running inside
+it. GPS glitches are clipped first: no step may imply more than 11 m/s.
+
+**True best efforts.** For each target distance *D*, a window slides along the
+cumulative-distance track, with distance and time interpolated linearly between
+samples. Every sample anchors a window twice, once as its start and once as its end;
+for a piecewise-linear track the fastest window always has one end on a sample, so the
+search is exact rather than a grid approximation. This replaces "fastest whole run of
+at least *D*" with "fastest *D* anywhere inside any run", and the pace curve plots the
+result from 400 m to the marathon.
+
+**True time in zone.** Each run stores the moving seconds it spent at every
+whole-number heart rate, so zones can be redrawn for any resting and max heart rate
+without re-reading a file. The Heart rate tab shows the result next to the
+average-HR shortcut for the same runs.
+
+**Splits and aerobic decoupling.** Per-kilometre moving time, pace, heart rate,
+cadence and elevation change, plus Friel's Pa:Hr decoupling — the percentage drop in
+speed per heartbeat from the first half of the run to the second. Under about 5% on a
+steady run means the aerobic base held.
+
+**Route maps.** Each run's cache also keeps a thinned copy of its GPS track — 300
+points, one per equal slice of distance, so a long stop does not crowd one spot — and
+the Run detail tab draws it coloured by pace (smoothed over a few points either side)
+or heart rate. By default the route is drawn on plain axes at equal-distance aspect,
+with no map behind it and nothing fetched. The **Street map** switch puts it on CARTO /
+OpenStreetMap tiles instead; the browser then downloads those tiles, which tells CARTO
+roughly where the run was. It is the only thing in the app that touches the network,
+and it is off until you turn it on.
+
+### Periods and units — `app.py`, `src/units.py`
+
+The sidebar's period narrows every tab to the runs inside it. Fitness, Fatigue, Form
+and ACWR are still computed over the whole history and only then cut to the period, so
+a period opens on the fitness you actually carried into it rather than on zero.
+Everything built from the runs themselves — volume, streaks, best efforts, PRs, zones,
+splits — is recomputed on the period's runs, and "recent" (the 90-day windows on the
+Performance tab) means the last 90 days of the period. The personal models and shoe
+mileage ignore the period: a fit needs every run it can get, and a shoe's wear does not
+reset on 1 January. "Last …" periods count back from your latest run, not from today.
+
+Kilometres or miles is a display setting only. Every module computes in kilometres and
+minutes per kilometre; `src/units.py` converts at the moment a number is formatted or
+plotted, so switching units can never change a result. Splits are cached per kilometre
+and per mile, and elevation follows the unit (metres or feet).
+
+### Personal models — `src/personal_models.py`
+
+**Your Riegel exponent.** `T = a × D^b` is a straight line on log–log axes, so *b* is
+the slope of an ordinary least-squares fit of log best-effort time on log distance,
+with a 95% interval from the slope's standard error and a t distribution on *n − 2*
+degrees of freedom (critical values are tabulated in the module, keeping the project
+free of scipy). The efforts are the GPS best efforts when available, otherwise the
+whole-run ones, restricted to a window (default 12 months) and a distance range you
+choose. Two cautions are printed with the result: best efforts at several distances
+often come from one run, so the points are not independent and the interval is
+optimistic; and a best half marathon from an easy long run is not a race, which tilts
+the line steeper. Fitting only distances you have raced gives the cleanest number.
+
+**Your Fitness and Fatigue time constants.** Banister's impulse-response model:
+
+```
+p(t) = p0 + k1 × F_τ1(t−1) − k2 × F_τ2(t−1) + c × (1 − 1/τ1)^t
+```
+
+`F_τ` is the same zero-seeded exponentially weighted average of daily load that drives
+the Fitness chart. The last term is fitness held *before* the export began, decaying
+at the fitness rate. Without it, a zero-seeded average reads an already-fit runner as
+having no fitness and spends months building it, and that artefact drags the fit
+toward short time constants. Its size *c* is estimated, not assumed.
+
+Performance has to be measured on ordinary runs, not only races. The **performance
+index** is the residual of a pooled regression of log speed (grade-adjusted where
+possible) on average heart rate and log distance, in percent: how much faster a run
+was than its heart rate and distance would predict. Getting fitter means running
+faster at the same heart rate, which is what the index measures.
+
+For fixed (τ1, τ2) the model is linear in (p0, k1, k2, c), so the fit is a grid search
+— τ1 from 10 to 90 days, τ2 from 2 to 25 — with a least-squares solve at each point.
+All ~1,000 solves run as one batched call on 4×4 normal equations gathered from a
+single Gram matrix. Only fits where fitness helps and fatigue hurts (k1, k2 > 0) are
+admissible. 200 bootstrap resamples of the runs refit the whole grid and give a 90%
+range for each constant. The tab shows the R² surface (usually a long flat ridge — the
+reason the ranges matter more than the single best pair), the variance explained
+against the same model held at 42 / 7 days, a warning when the best value sits on the
+edge of the grid, and the modelled effect of one session day by day — when it turns
+net positive and when it peaks.
+
+The model is checked by simulation in the tests: from load and performances generated
+with τ1 = 30 and τ2 = 9 plus noise and a pre-export head start, the fit recovers both
+constants and the head start.
+
+### Shoe mileage — `src/gear.py`
+
+Distance per shoe from the `Activity Gear` column, with a retirement slider (default
+700 km). A shoe is flagged "Replace soon" at 90% of the limit and "Past limit" beyond
+it; one not worn in the last 60 days of the data counts as retired, because the
+export does not say which shoes have been retired.
 
 ### Best efforts and race predictions — `src/performance.py`
 
@@ -188,12 +327,18 @@ lets you read your own trend rather than issuing a verdict.
 1. Go to **Strava.com → Settings → My Account → Download or Delete Your Account**.
 2. Choose **Request Your Archive**. Strava emails a download link, usually within
    a few hours.
-3. Unzip the archive and copy `activities.csv` into `data/raw/`.
+3. Unzip the archive and copy `activities.csv` into `data/raw/`. Copy the
+   archive's `activities/` folder of GPS recordings into `data/raw/` as well, so
+   that `data/raw/activities/` sits next to the CSV. It is optional, but it is what
+   powers true best efforts, second-by-second zones and the Run detail tab.
 4. Restart the dashboard. The sidebar now offers your export as a data source and
-   selects it by default.
+   selects it by default. The first load reads every GPS file once, with a progress
+   bar; after that they come from the cache.
 
-Nothing leaves your machine: the app reads the CSV from disk and there is no
-network call anywhere in the codebase.
+Nothing leaves your machine: the app reads the export from disk and there is no
+network call anywhere in the codebase. The one exception is opt-in — the Run detail
+tab's **Street map** switch, which has your browser load map tiles from CARTO. `.fit` files are decoded with `fitdecode`;
+GPX and TCX need nothing beyond the standard library.
 
 The loader is deliberately defensive, because Strava's export format has drifted
 between versions. It filters to runs, accepts distances in either metres or
@@ -206,11 +351,12 @@ exercised by the sample rather than bypassed.
 
 ## Limitations
 
-- **Best efforts are activity-level, not true splits.** A "5K PR" here is the
-  fastest average pace held over a run of at least 5 km, so a 5 km surge in the
-  middle of a 20 km long run is invisible. Real in-run splits need the per-activity
-  GPX streams, not `activities.csv`. Expect these numbers to be slightly
-  conservative against Strava's own.
+- **Without the GPS files, best efforts are activity-level.** A "5K PR" from
+  `activities.csv` alone is the fastest average pace held over a run of at least
+  5 km, so a 5 km surge inside a 20 km long run is invisible. With the `activities/`
+  folder the Performance tab shows true in-run bests alongside. Those use moving
+  time; Strava may count a stop inside the effort, so they can read slightly faster
+  than Strava's own.
 - **The training-load model is a transparent proxy, not Strava's formula.** The
   shape of the Fitness/Freshness curve matches; the absolute numbers will not, and
   they are not comparable to Strava's Relative Effort or to TrainingPeaks' TSS.
@@ -220,17 +366,24 @@ exercised by the sample rather than bypassed.
 - **`hr_rest` and `hr_max` default to 60 and 190**, which are not your values.
   Set yours in the sidebar: the heart-rate half of the load score and every zone
   boundary are only as good as those two numbers.
-- **Heart-rate zones come from each run's average heart rate.** An interval
-  session averaging Z3 really swung between Z1 and Z5, so the distribution
-  understates both ends and overstates the middle. True time-in-zone needs the
-  per-activity heart-rate streams.
+- **Without the GPS files, heart-rate zones come from each run's average.** An
+  interval session averaging Z3 really swung between Z1 and Z5, so that
+  distribution understates both ends and overstates the middle. With the files,
+  zones are counted second by second.
+- **The fitted models are only as good as the data.** A Banister fit needs months
+  of runs with heart rate and real variation in training load; a steady routine
+  leaves the time constants poorly identified, which the bootstrap ranges and the
+  flat R² surface make visible rather than hide. The performance index assumes the
+  relation between heart rate and speed is otherwise stable, so heat, illness or a
+  new heart-rate strap shows up as a change in "fitness".
 - **Riegel assumes a constant fatigue exponent.** 1.06 is a population fit. It is
   pessimistic for well-trained marathoners and optimistic for beginners, and it
   cannot know whether you have done the long runs a marathon requires.
 - **ACWR is contested.** The 0.8–1.3 band is widely cited and widely criticised;
   treat it as a conversation starter about your own trend, not a risk score.
-- **Elevation and weather are ignored.** A hilly run and a flat run of the same
-  pace score the same load, except insofar as heart rate picks up the difference.
+- **Weather is ignored, and elevation only partly handled.** Where the export has
+  Strava's grade-adjusted distance, hills are accounted for in the load score;
+  otherwise only heart rate picks up the difference. Heat is never adjusted for.
 
 ## Repository layout
 
@@ -239,8 +392,8 @@ exercised by the sample rather than bypassed.
 ├── requirements.txt            # pinned dependencies
 ├── SPEC.md                     # the original project specification
 ├── data/
-│   ├── raw/                    # drop your own Strava activities.csv here
-│   └── sample/                 # generated synthetic export (not committed)
+│   ├── raw/                    # your Strava activities.csv (+ activities/ folder)
+│   └── sample/                 # generated synthetic export + GPS files (not committed)
 ├── src/
 │   ├── generate_sample.py      # realistic synthetic activities.csv
 │   ├── loader.py               # export -> tidy DataFrame, defensively
@@ -248,7 +401,12 @@ exercised by the sample rather than bypassed.
 │   ├── performance.py          # best efforts, PRs, Riegel, pace trends
 │   ├── consistency.py          # volume, streaks, ACWR
 │   ├── race_calculator.py      # parse a typed time, Riegel at any exponent
-│   ├── heart_rate.py           # HR-reserve zones, time-in-zone distribution
+│   ├── heart_rate.py           # HR-reserve zones, time in zone (average HR or streams)
+│   ├── streams.py              # GPX/TCX/FIT parsing, in-run bests, splits, cache
+│   ├── personal_models.py      # personal Riegel exponent, fitted Banister model
+│   ├── gear.py                 # shoe mileage and retirement
+│   ├── units.py                # kilometres / miles display conversion
+│   ├── recovery.py             # sleep / HRV import and correlations
 │   └── plots.py                # plotly figure builders
 └── tests/                      # pytest: loader contract, load model, predictions, workload
 ```
@@ -260,7 +418,14 @@ a slowly improving threshold pace with week-to-week noise, a realistic mix of
 easy, tempo, long and short runs, rest weeks every fifth week, two multi-week
 breaks followed by a decaying detraining penalty, heart rate correlated with
 relative intensity plus cardiac drift on long runs, and roughly 10% of heart-rate
-values missing. It also writes a few rides, walks and one zero-distance row, so
+values missing. Fitness follows training — threshold pace tracks a 42-day average of
+distance while weekly volume ramps up — and a week of overload makes the next runs
+slower at the same heart rate, so the personal models have a real signal to find. The
+sample also carries the newer export columns (max heart rate, per-leg cadence,
+grade-adjusted distance, Relative Effort, shoes) and a gzipped GPX recording per run,
+with intervals inside tempo sessions, fast finishes inside long runs, hills, a lagging
+heart rate and stops at crossings. Those extras draw on a separate per-activity
+random stream. It also writes a few rides, walks and one zero-distance row, so
 the loader's filtering and cleaning are exercised by the sample data.
 
 ### Tests
@@ -281,5 +446,16 @@ week and stays undefined during a layoff rather than dividing by zero.
 `tests/test_race_calculator.py` checks time parsing (and that `5:75` is rejected
 rather than read as 6:15) and that the exponent moves predictions the right way.
 `tests/test_heart_rate.py` checks zone boundaries against hand-computed bpm,
-that runs without heart rate are excluded from shares, and that empty months
-are zero-filled.
+that runs without heart rate are excluded from shares, that empty months are
+zero-filled, and that stream-based zones credit each second to its own zone.
+`tests/test_streams.py` checks best efforts against hand-computed windows (including
+one that starts between samples), that stops and GPS glitches cannot speed an effort
+up, splits, decoupling, GPX/TCX/FIT parsing (the FIT file is encoded byte by byte in
+the test), the cache's reuse and invalidation, and on the synthetic export that in-run
+bests are never slower than whole-run ones. `tests/test_personal_models.py` checks the
+Riegel fit and its interval, and that the Banister fit recovers known time constants
+from simulated training. `tests/test_gear.py` covers shoe status. `tests/test_units.py`
+checks the kilometre / mile conversions, and the stream tests cover GPS positions, route
+thinning (a stop adds no points), per-mile splits and pruning of stale cache files.
+`tests/test_app.py` drives the whole dashboard through Streamlit's `AppTest` — miles,
+a narrower period and the route map in both modes — and fails on any exception.

@@ -137,3 +137,13 @@ def test_empty_history_is_handled():
     scored = compute_activity_load(empty)
     assert scored.empty and "load" in scored.columns
     assert daily_load_series(scored).empty
+
+
+def test_grade_adjusted_pace_drives_intensity_when_present():
+    """A hilly run scores as hard as its flat-equivalent pace, not its raw pace."""
+    runs = make_runs([{"activity_id": 1}, {"activity_id": 2}])
+    runs["gap_pace_min_per_km"] = [np.nan, 4.5]  # run 2 was hilly: 5:00 raw, 4:30 flat
+    scored = compute_activity_load(runs, threshold_pace=5.0)
+    assert scored["intensity_factor"].iloc[0] == pytest.approx(1.0)
+    assert scored["intensity_factor"].iloc[1] == pytest.approx(5.0 / 4.5)
+    assert scored["load"].iloc[1] > scored["load"].iloc[0]

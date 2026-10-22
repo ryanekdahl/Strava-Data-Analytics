@@ -14,6 +14,10 @@ Step 1 -- intensity factor
     athlete's own data (see :func:`estimate_threshold_pace`), which keeps the
     scale personal rather than absolute.
 
+    When the export carries Strava's grade-adjusted pace, that is the pace used
+    here and for the threshold estimate (see :func:`effort_pace`): a slow climb
+    is hard work, and flat-equivalent pace scores it as such.
+
 Step 2 -- pace-based load (an rTSS-style score)
     ``load_pace = duration_hours * IF ** 2 * 100``
 
@@ -67,6 +71,14 @@ _THRESHOLD_HRR = 0.85
 _TRIMP_REFERENCE = 60.0 * _THRESHOLD_HRR * 0.64 * float(np.exp(1.92 * _THRESHOLD_HRR))
 
 
+def effort_pace(activities: pd.DataFrame) -> pd.Series:
+    """Grade-adjusted pace where the export has it, raw pace everywhere else."""
+    pace = activities["pace_min_per_km"]
+    if "gap_pace_min_per_km" not in activities:
+        return pace
+    return activities["gap_pace_min_per_km"].fillna(pace)
+
+
 def estimate_threshold_pace(
     activities: pd.DataFrame,
     min_distance_km: float = THRESHOLD_MIN_DISTANCE_KM,
@@ -79,11 +91,10 @@ def estimate_threshold_pace(
     the module falls back to :data:`FALLBACK_THRESHOLD_PACE`, which keeps the
     load scale defined for a brand-new athlete.
     """
-    paces = activities.loc[
-        activities["distance_km"] >= min_distance_km, "pace_min_per_km"
-    ].dropna()
+    pace = effort_pace(activities)
+    paces = pace[activities["distance_km"] >= min_distance_km].dropna()
     if paces.empty:
-        paces = activities["pace_min_per_km"].dropna()
+        paces = pace.dropna()
     if paces.empty:
         return FALLBACK_THRESHOLD_PACE
     return float(paces.quantile(quantile))
@@ -124,7 +135,7 @@ def compute_activity_load(
         threshold_pace = estimate_threshold_pace(result)
 
     duration_hours = result["moving_time_s"] / 3600.0
-    result["intensity_factor"] = threshold_pace / result["pace_min_per_km"]
+    result["intensity_factor"] = threshold_pace / effort_pace(result)
     result["load_pace"] = duration_hours * result["intensity_factor"] ** 2 * 100.0
     result["load_hr"] = trimp(result["moving_time_s"], result["avg_hr"], hr_rest, hr_max)
 

@@ -61,12 +61,12 @@ def format_duration(seconds: float | None) -> str:
     return f"{minutes}:{secs:02d}"
 
 
-def format_pace(pace_min_per_km: float | None) -> str:
-    """Format a min/km pace as ``M:SS /km``."""
+def format_pace(pace_min_per_km: float | None, suffix: str = " /km") -> str:
+    """Format a min/km pace as ``M:SS /km`` (see :mod:`src.units` for miles)."""
     if pace_min_per_km is None or not np.isfinite(pace_min_per_km):
         return "--"
     minutes, seconds = divmod(int(round(pace_min_per_km * 60)), 60)
-    return f"{minutes}:{seconds:02d} /km"
+    return f"{minutes}:{seconds:02d}{suffix}"
 
 
 def best_efforts(

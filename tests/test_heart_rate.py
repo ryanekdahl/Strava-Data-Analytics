@@ -7,7 +7,8 @@ import pandas as pd
 import pytest
 
 from src.heart_rate import (
-    assign_zone, hr_coverage, monthly_zone_hours, zone_distribution, zone_table,
+    assign_zone, hr_coverage, monthly_zone_hours, stream_monthly_zone_hours,
+    stream_zone_distribution, zone_distribution, zone_table,
 )
 
 
@@ -60,3 +61,39 @@ def test_monthly_zone_hours_zero_fills_empty_months_and_zones():
     assert february["hours"].sum() == 0.0
     march = monthly[monthly["month_start"] == pd.Timestamp("2026-03-01")].set_index("zone")
     assert march.loc[4, "hours"] == pytest.approx(1.0)
+
+
+def make_histogram(rows: list[tuple[int, str, int, float]]) -> pd.DataFrame:
+    """``StreamData.hr_seconds`` from ``(activity_id, date, bpm, seconds)``."""
+    frame = pd.DataFrame(rows, columns=["activity_id", "date", "bpm", "seconds"])
+    frame["date"] = pd.to_datetime(frame["date"])
+    return frame
+
+
+def test_stream_zones_credit_each_second_to_its_own_zone():
+    # One interval run: 30 min at 120 bpm (Z1) and 10 min at 180 bpm (Z5), which
+    # averages ~135 bpm -- Z2 under the whole-run method.
+    hist = make_histogram([(1, "2024-01-01", 120, 1800.0), (1, "2024-01-01", 180, 600.0)])
+    zones = stream_zone_distribution(hist, hr_rest=60, hr_max=190).set_index("zone")
+    assert zones.loc[1, "hours"] == pytest.approx(0.5)
+    assert zones.loc[5, "hours"] == pytest.approx(600 / 3600)
+    assert zones.loc[2, "hours"] == 0.0
+    assert zones["share"].sum() == pytest.approx(1.0)
+    assert zones.loc[1, "runs"] == 1 and zones.loc[5, "runs"] == 1
+
+
+def test_stream_zones_match_the_average_method_columns():
+    hist = make_histogram([(1, "2024-01-01", 150, 600.0)])
+    runs = make_runs([("2024-01-01", 600, 150.0)])
+    assert list(stream_zone_distribution(hist).columns) == list(zone_distribution(runs).columns)
+    assert list(stream_monthly_zone_hours(hist).columns) == list(monthly_zone_hours(runs).columns)
+
+
+def test_stream_monthly_hours_zero_fill_and_empty_input():
+    hist = make_histogram([(1, "2024-01-15", 120, 3600.0), (2, "2024-03-02", 120, 1800.0)])
+    monthly = stream_monthly_zone_hours(hist, hr_rest=60, hr_max=190)
+    assert len(monthly) == 3 * 5  # Jan-Mar, every zone, February included
+    february = monthly[monthly["month_start"] == pd.Timestamp("2024-02-01")]
+    assert february["hours"].sum() == 0.0
+    assert stream_monthly_zone_hours(hist.iloc[0:0]).empty
+    assert stream_zone_distribution(hist.iloc[0:0])["hours"].sum() == 0.0
