@@ -189,3 +189,53 @@ def stream_monthly_zone_hours(
     labels = zone_table(hr_rest, hr_max).set_index("zone")["label"]
     frame["label"] = frame["zone"].map(labels)
     return frame[columns]
+
+
+def _per_run_frame(seconds: pd.Series, dates: pd.Series, hr_rest: float,
+                   hr_max: float) -> pd.DataFrame:
+    """Zero-fill ``seconds`` (indexed by activity_id, zone) to every zone of every run."""
+    columns = ["activity_id", "date", "zone", "label", "minutes", "share"]
+    if seconds.empty:
+        return pd.DataFrame(columns=columns)
+    grid = pd.MultiIndex.from_product(
+        [seconds.index.get_level_values(0).unique(), [zone for zone, _, _ in ZONES]],
+        names=["activity_id", "zone"])
+    frame = (seconds.reindex(grid, fill_value=0.0) / 60.0).rename("minutes").reset_index()
+    totals = frame.groupby("activity_id")["minutes"].transform("sum")
+    frame["share"] = (frame["minutes"] / totals).where(totals > 0, 0.0)
+    frame["date"] = frame["activity_id"].map(dates)
+    labels = zone_table(hr_rest, hr_max).set_index("zone")["label"]
+    frame["label"] = frame["zone"].map(labels)
+    return frame.sort_values(["date", "activity_id", "zone"]).reset_index(drop=True)[columns]
+
+
+def run_zone_breakdown(
+    activities: pd.DataFrame, hr_rest: float = DEFAULT_HR_REST, hr_max: float = DEFAULT_HR_MAX
+) -> pd.DataFrame:
+    """Each run's minutes and share per zone, from its average heart rate.
+
+    Under the average-HR approximation a run sits wholly in one zone, so every
+    run has one zone at 100%.  Returns long-form
+    ``DataFrame[activity_id, date, zone, label, minutes, share]`` with all five
+    zones per run; runs without heart rate are left out.
+    """
+    zones = assign_zone(activities["avg_hr"], hr_rest, hr_max)
+    with_hr = activities.assign(zone=zones).dropna(subset=["zone"]).astype({"zone": int})
+    seconds = with_hr.groupby(["activity_id", "zone"])["moving_time_s"].sum().astype(float)
+    return _per_run_frame(seconds, with_hr.set_index("activity_id")["date"], hr_rest, hr_max)
+
+
+def stream_run_zone_breakdown(
+    hr_seconds: pd.DataFrame, hr_rest: float = DEFAULT_HR_REST, hr_max: float = DEFAULT_HR_MAX
+) -> pd.DataFrame:
+    """Each run's true minutes and share per zone from second-by-second heart rate.
+
+    Same long-form columns as :func:`run_zone_breakdown`.
+    """
+    if hr_seconds.empty:
+        return _per_run_frame(pd.Series(dtype=float), pd.Series(dtype="datetime64[ns]"),
+                              hr_rest, hr_max)
+    zoned = _stream_zones(hr_seconds, hr_rest, hr_max)
+    seconds = zoned.groupby(["activity_id", "zone"])["seconds"].sum().astype(float)
+    dates = zoned.drop_duplicates("activity_id").set_index("activity_id")["date"]
+    return _per_run_frame(seconds, dates, hr_rest, hr_max)

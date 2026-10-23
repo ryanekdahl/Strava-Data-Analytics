@@ -31,8 +31,8 @@ from src.consistency import (
 from src.gear import DEFAULT_RETIRE_KM, INACTIVE_DAYS, gear_summary, unassigned_share
 from src.generate_sample import generate_sample
 from src.heart_rate import (
-    hr_coverage, monthly_zone_hours, stream_monthly_zone_hours, stream_zone_distribution,
-    zone_distribution,
+    hr_coverage, monthly_zone_hours, run_zone_breakdown, stream_monthly_zone_hours,
+    stream_run_zone_breakdown, stream_zone_distribution, zone_distribution,
 )
 from src.loader import SAMPLE_CSV, find_real_export, load_activities
 from src.performance import (
@@ -552,6 +552,10 @@ def heart_rate_tab(data: dict, stream_data) -> None:
     st.plotly_chart(plots.monthly_zone_figure(monthly), width="stretch")
     st.caption("The same split month by month, so you can see hard blocks and easy phases.")
 
+    breakdown = (stream_run_zone_breakdown(hr_seconds, hr_rest, hr_max) if from_streams
+                 else run_zone_breakdown(activities, hr_rest, hr_max))
+    run_zone_section(breakdown, activities, data["units"], from_streams)
+
     st.dataframe(
         zones.assign(share=zones["share"].map(lambda s: f"{s:.0%}"),
                      hours=zones["hours"].map(lambda h: f"{h:.1f}"))
@@ -579,6 +583,44 @@ def heart_rate_tab(data: dict, stream_data) -> None:
             "sessions are credited to the middle zones even though they swing between easy "
             "and hard. Add the export's `activities/` folder for second-by-second zones."
         )
+
+
+def run_zone_section(breakdown: pd.DataFrame, activities: pd.DataFrame, units: Units,
+                     from_streams: bool) -> None:
+    """Each logged run's split across the zones: a chart of recent runs and a full table."""
+    if breakdown.empty:
+        return
+    st.subheader("Run by run")
+    runs = (activities[activities["activity_id"].isin(breakdown["activity_id"])]
+            .sort_values("date", ascending=False).set_index("activity_id"))
+    labels = pd.Series({a: f"{row.date:%d %b %Y} · {row['name']}" if row["name"]
+                        else f"{row.date:%d %b %Y}" for a, row in runs.iterrows()})
+    shown = (st.slider("Recent runs to chart", 5, min(60, len(runs)), min(20, len(runs)))
+             if len(runs) > 5 else len(runs))
+    recent = breakdown[breakdown["activity_id"].isin(runs.index[:shown])]
+    st.plotly_chart(plots.run_zone_figure(recent, labels), width="stretch")
+    st.caption(
+        "How each run's time split across the zones, newest at the top. Easy runs should be "
+        "almost all light blue; hard sessions show up as dark bars."
+        if from_streams else
+        "Without the GPS recordings each run is credited wholly to the zone of its average "
+        "heart rate, so every bar is a single colour."
+    )
+
+    shares = (breakdown.pivot(index="activity_id", columns="zone", values="share")
+              .reindex(runs.index))
+    table = pd.DataFrame({
+        "Date": runs["date"].dt.strftime("%Y-%m-%d"),
+        "Run": runs["name"],
+        "Distance": runs["distance_km"].map(units.format_distance),
+        "Time": runs["moving_time_s"].map(format_duration),
+        "Avg HR": runs["avg_hr"].map(lambda h: f"{h:.0f}" if pd.notna(h) else "--"),
+    })
+    for zone in shares.columns:
+        table[f"Z{zone}"] = shares[zone].map(lambda s: f"{s:.0%}" if s > 0 else "")
+    table["Easy (Z1-Z2)"] = shares[[1, 2]].sum(axis=1).map(lambda s: f"{s:.0%}")
+    with st.expander(f"All {len(runs):,} runs with heart rate"):
+        st.dataframe(table, hide_index=True, width="stretch")
 
 
 def consistency_tab(data: dict) -> None:

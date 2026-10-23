@@ -306,6 +306,34 @@ def monthly_zone_figure(monthly: pd.DataFrame) -> go.Figure:
     return _base(fig, height=380, y_title="Hours")
 
 
+def run_zone_figure(breakdown: pd.DataFrame, run_labels: pd.Series) -> go.Figure:
+    """One 100%-stacked bar per run, newest on top, easy zones on the left.
+
+    ``breakdown`` is long-form per-run zone time from
+    :func:`src.heart_rate.run_zone_breakdown`; ``run_labels`` maps activity_id
+    to the text shown on the axis.
+    """
+    order = (breakdown.drop_duplicates("activity_id")
+             .sort_values("date", ascending=True)["activity_id"].tolist())
+    fig = go.Figure()
+    for color, (_, frame) in zip(ZONE_COLORS, breakdown.groupby("zone", sort=True)):
+        frame = frame.set_index("activity_id").loc[order]
+        name = frame["label"].iloc[0]
+        fig.add_trace(go.Bar(
+            y=[run_labels[a] for a in order], x=frame["share"] * 100.0, name=name,
+            orientation="h", customdata=frame["minutes"],
+            marker=dict(color=color, line=dict(width=1, color=SURFACE)),
+            hovertemplate=(f"{name}: %{{x:.0f}}% (%{{customdata:.0f}} min)"
+                           "<extra>%{y}</extra>"),
+        ))
+    fig.update_layout(title="Zone mix run by run", barmode="stack", bargap=0.25,
+                      hovermode="closest")
+    _base(fig, height=max(320, 120 + 22 * len(order)), x_title="Share of run (%)")
+    fig.update_xaxes(range=[0, 100], showgrid=True, gridcolor=GRID)
+    fig.update_yaxes(showgrid=False, tickfont=dict(color=INK_SECONDARY))
+    return fig
+
+
 def recovery_timeline_figure(
     joined: pd.DataFrame, column: str, baseline: pd.Series, title: str, y_title: str
 ) -> go.Figure:

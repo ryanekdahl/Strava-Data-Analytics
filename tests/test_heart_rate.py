@@ -7,8 +7,8 @@ import pandas as pd
 import pytest
 
 from src.heart_rate import (
-    assign_zone, hr_coverage, monthly_zone_hours, stream_monthly_zone_hours,
-    stream_zone_distribution, zone_distribution, zone_table,
+    assign_zone, hr_coverage, monthly_zone_hours, run_zone_breakdown, stream_monthly_zone_hours,
+    stream_run_zone_breakdown, stream_zone_distribution, zone_distribution, zone_table,
 )
 
 
@@ -97,3 +97,29 @@ def test_stream_monthly_hours_zero_fill_and_empty_input():
     assert february["hours"].sum() == 0.0
     assert stream_monthly_zone_hours(hist.iloc[0:0]).empty
     assert stream_zone_distribution(hist.iloc[0:0])["hours"].sum() == 0.0
+
+
+def test_run_breakdown_puts_each_run_wholly_in_its_average_zone():
+    runs = make_runs([("2026-01-05", 3600, 125.0), ("2026-01-07", 1800, np.nan),
+                      ("2026-01-09", 1800, 155.0)])
+    breakdown = run_zone_breakdown(runs, hr_rest=60, hr_max=160)
+    assert sorted(breakdown["activity_id"].unique()) == [1, 3]  # no-HR run left out
+    assert len(breakdown) == 2 * 5
+    first = breakdown[breakdown["activity_id"] == 1].set_index("zone")
+    assert first.loc[2, "minutes"] == pytest.approx(60.0)
+    assert first.loc[2, "share"] == pytest.approx(1.0)
+    assert first["share"].sum() == pytest.approx(1.0)
+
+
+def test_stream_run_breakdown_splits_an_interval_run_across_zones():
+    hist = make_histogram([(1, "2024-01-01", 120, 1800.0), (1, "2024-01-01", 180, 600.0),
+                           (2, "2024-01-03", 125, 3000.0)])
+    breakdown = stream_run_zone_breakdown(hist, hr_rest=60, hr_max=190)
+    intervals = breakdown[breakdown["activity_id"] == 1].set_index("zone")
+    assert intervals.loc[1, "minutes"] == pytest.approx(30.0)
+    assert intervals.loc[5, "share"] == pytest.approx(0.25)
+    assert intervals.loc[[2, 3, 4], "minutes"].sum() == 0.0
+    assert breakdown.groupby("activity_id")["share"].sum().tolist() == pytest.approx([1.0, 1.0])
+    assert list(breakdown.columns) == list(
+        run_zone_breakdown(make_runs([("2024-01-01", 600, 150.0)])).columns)
+    assert stream_run_zone_breakdown(hist.iloc[0:0]).empty
