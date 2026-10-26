@@ -8,6 +8,10 @@ If the export's ``activities/`` folder of GPS recordings sits next to the CSV,
 the app reads those too (once, then from a cache) for true in-run best efforts,
 second-by-second heart-rate zones and per-kilometre splits.
 
+Rides, swims, walks and gym sessions in the export are scored on the same
+load axis as runs (``src/sports.py``); by default they count toward Fitness,
+Fatigue and ACWR, and the All sports tab breaks the load down by sport.
+
 The sidebar narrows every tab to a period (Fitness and ACWR still count the
 runs before it) and switches the display between kilometres and miles; all
 computation stays metric underneath.
@@ -29,12 +33,12 @@ from src.consistency import (
     weekly_streaks, weekly_volume,
 )
 from src.gear import DEFAULT_RETIRE_KM, INACTIVE_DAYS, gear_summary, unassigned_share
-from src.generate_sample import generate_sample
+from src.generate_sample import generate_sample, sample_is_current
 from src.heart_rate import (
     hr_coverage, monthly_zone_hours, run_zone_breakdown, stream_monthly_zone_hours,
     stream_run_zone_breakdown, stream_zone_distribution, zone_distribution,
 )
-from src.loader import SAMPLE_CSV, find_real_export, load_activities
+from src.loader import SAMPLE_CSV, find_real_export, load_activities, load_other_activities
 from src.performance import (
     RECENT_WINDOW_DAYS, RIEGEL_EXPONENT, Effort, best_effort_frontier, best_recent_effort,
     format_duration, personal_records, predict_races, recent_vs_all_time,
@@ -47,6 +51,10 @@ from src.personal_models import (
 from src.recovery import (
     RECOVERY_CSV, RECOVERY_METRICS, TEMPLATE_CSV, TRAINING_METRICS, correlation_table,
     join_recovery, load_recovery, rolling_baseline, synthetic_recovery,
+)
+from src.sports import (
+    DEFAULT_INTENSITY, METHOD_DEFAULT, all_sessions, compute_other_load, sport_summary,
+    weekly_sport_hours,
 )
 from src.race_calculator import (
     CALCULATOR_DISTANCES, EXPONENT_RANGE, calculator_predictions, parse_duration,
@@ -72,15 +80,28 @@ st.set_page_config(page_title="Strava Run Analytics", page_icon=":running_shirt_
 
 
 @st.cache_data(show_spinner="Crunching activities...")
-def build_analytics(path: str, _mtime: float, hr_rest: float, hr_max: float) -> dict:
-    """Run the whole pipeline once per file and HR setting; ``_mtime`` busts the cache on edit."""
+def build_analytics(path: str, _mtime: float, hr_rest: float, hr_max: float,
+                    include_other: bool = True, ftp: float | None = None) -> dict:
+    """Run the whole pipeline once per file and setting; ``_mtime`` busts the cache on edit.
+
+    With ``include_other`` the non-run sessions' load joins the runs' in the
+    daily series, so Fitness, Fatigue, ACWR and the Banister fit all see it.
+    """
     activities = load_activities(path)
     with_load = compute_activity_load(activities, hr_rest=hr_rest, hr_max=hr_max)
-    daily = daily_load_series(with_load)
+    other = compute_other_load(load_other_activities(path), ftp=ftp, hr_rest=hr_rest,
+                               hr_max=hr_max)
+    counted = (pd.concat([with_load[["date", "load"]], other[["date", "load"]]])
+               if include_other and not other.empty else with_load)
+    daily = daily_load_series(counted)
     performance = performance_index(activities)
     return {
         "activities": activities,
         "scored": with_load,
+        "other": other,
+        "sessions": all_sessions(with_load, other),
+        "include_other": include_other and not other.empty,
+        "ftp": ftp,
         "daily": daily,
         "fitness": compute_fitness_freshness(daily),
         "ctl_days": CTL_DAYS,
@@ -128,6 +149,13 @@ def prepare_streams(path: Path, activities: pd.DataFrame) -> streams.StreamData 
 
 
 @st.cache_data(show_spinner=False)
+def other_sports_info(path: str, _mtime: float) -> tuple[int, bool]:
+    """How many non-run sessions the export has, and whether any ride carries power."""
+    other = load_other_activities(path)
+    return len(other), bool(other[["avg_watts", "weighted_watts"]].notna().any().any())
+
+
+@st.cache_data(show_spinner=False)
 def read_recovery(content: bytes) -> pd.DataFrame:
     """Parse a sleep/HRV CSV once per distinct file contents."""
     return load_recovery(content)
@@ -136,7 +164,7 @@ def read_recovery(content: bytes) -> pd.DataFrame:
 def choose_source() -> Path:
     """Sidebar data-source picker; falls back to the synthetic sample."""
     st.sidebar.title("Strava Run Analytics")
-    if not SAMPLE_CSV.exists() or not (SAMPLE_CSV.parent / "activities").is_dir():
+    if not sample_is_current() or not (SAMPLE_CSV.parent / "activities").is_dir():
         with st.spinner("Generating sample data..."):
             generate_sample(SAMPLE_CSV)
 
@@ -195,6 +223,7 @@ def restrict_period(data: dict, start: pd.Timestamp, end: pd.Timestamp) -> dict:
     into it rather than on zero.  Everything built from the runs themselves is
     recomputed on the period's runs.  ``daily``, ``performance`` and the fits
     keep the whole history (the personal models need every run they can get),
+    the non-run ``other`` sessions and the combined ``sessions`` are cut too,
     and ``all_activities`` keeps every run for the shoe-mileage tab.
     """
     data = {**data, "all_activities": data["activities"]}
@@ -212,6 +241,8 @@ def restrict_period(data: dict, start: pd.Timestamp, end: pd.Timestamp) -> dict:
         **data,
         "activities": runs,
         "scored": cut(data["scored"]),
+        "other": cut(data["other"]),
+        "sessions": cut(data["sessions"]),
         "fitness": cut(data["fitness"]),
         "acwr": cut(data["acwr"]),
         "weekly": weekly_volume(runs),
@@ -234,6 +265,28 @@ def choose_heart_rate() -> tuple[float, float]:
         st.sidebar.warning("Max HR should be well above resting HR; using the defaults.")
         return DEFAULT_HR_REST, DEFAULT_HR_MAX
     return float(hr_rest), float(hr_max)
+
+
+def choose_other_sports(path: Path) -> tuple[bool, float | None]:
+    """Sidebar controls for non-run sessions: count them toward Fitness, and an FTP for rides.
+
+    Hidden entirely for an export with nothing but runs.
+    """
+    count, has_power = other_sports_info(str(path), path.stat().st_mtime)
+    if not count:
+        return False, None
+    st.sidebar.subheader("Other sports")
+    include = st.sidebar.toggle(
+        "Count them in Fitness & Form", value=True, key="include_other",
+        help=f"{count:,} rides, swims, walks and other sessions in this export. On, their "
+             "load is added to the runs' for Fitness, Fatigue, Form and ACWR.")
+    ftp = None
+    if has_power:
+        ftp = st.sidebar.number_input(
+            "Cycling FTP (W)", 0, 600, 0, step=5, key="ftp",
+            help="Your functional threshold power. Set it to score rides with a power meter "
+                 "by TSS; leave it at 0 to score them by heart rate alone.") or None
+    return include, None if ftp is None else float(ftp)
 
 
 def choose_time_constants() -> bool:
@@ -303,7 +356,20 @@ def overview_tab(data: dict) -> None:
         f"relative to it, and ACWR compares this week's load with the last month's. "
         f"Threshold pace is estimated at {units.format_pace(data['threshold_pace'])} from your "
         "own runs."
+        + other_sports_note(data)
     )
+
+
+def other_sports_note(data: dict) -> str:
+    """A sentence on whether the period's non-run sessions count toward Fitness."""
+    other = data["other"]
+    if other.empty:
+        return ""
+    hours = other["moving_time_s"].sum() / 3600.0
+    return (f" Fitness, Form and ACWR include {len(other):,} other sessions ({hours:,.0f} h) "
+            "-- see All sports." if data["include_other"] else
+            f" {len(other):,} other sessions ({hours:,.0f} h) are left out of Fitness, Form "
+            "and ACWR (sidebar).")
 
 
 def fitness_tab(data: dict) -> None:
@@ -339,6 +405,13 @@ def fitness_tab(data: dict) -> None:
             Form is yesterday's Fitness minus yesterday's Fatigue.
             """
         )
+        if data["include_other"]:
+            st.markdown(
+                "Rides, swims, walks and gym sessions are on the same axis: heart-rate "
+                "TRIMP where they have heart rate, cycling TSS from power when an FTP is set, "
+                "and a stated default intensity per sport otherwise. Their load is added to "
+                "the runs' each day -- the All sports tab shows how."
+            )
     relative_effort_section(data)
 
 
@@ -671,6 +744,87 @@ def consistency_tab(data: dict) -> None:
         f"sustainably; well above it you are ramping faster than your body is adapting, "
         f"which is the classic injury-risk pattern."
     )
+
+
+def sports_tab(data: dict) -> None:
+    sessions, other, units = data["sessions"], data["other"], data["units"]
+    if data["other"].empty:
+        st.info("Every activity in this period is a run. Rides, swims, walks and gym "
+                "sessions in your export show up here, and count toward Fitness and Form.")
+        return
+    summary = sport_summary(sessions)
+    hours = sessions["moving_time_s"].sum() / 3600.0
+    other_hours = other["moving_time_s"].sum() / 3600.0
+    total_load = sessions["load"].sum()
+    cards = st.columns(4)
+    cards[0].metric("Sessions", f"{len(sessions):,}",
+                    delta=f"{len(other):,} not runs", delta_color="off")
+    cards[1].metric("Hours trained", f"{hours:,.0f} h")
+    cards[2].metric("Cross-training share of time", f"{other_hours / hours:.0%}"
+                    if hours else "--")
+    cards[3].metric("Cross-training share of load", f"{other['load'].sum() / total_load:.0%}"
+                    if total_load else "--")
+    if not data["include_other"]:
+        st.warning("These sessions are shown here but left out of Fitness, Form and ACWR. "
+                   "Switch **Count them in Fitness & Form** on in the sidebar to include them.")
+
+    value = st.radio("Stack by", ["Hours", "Training load"], horizontal=True,
+                     key="sport_stack")
+    weekly = weekly_sport_hours(sessions)
+    st.plotly_chart(plots.sport_weekly_figure(weekly, "hours" if value == "Hours" else "load"),
+                    width="stretch")
+    st.caption("Every session per calendar week, stacked by sport with runs at the bottom. "
+               "Weeks where the runs disappear but the bar does not are cross-training "
+               "carrying your fitness -- through an injury, say.")
+
+    left, right = st.columns([2, 3])
+    with left:
+        st.plotly_chart(plots.sport_load_figure(summary), width="stretch")
+    with right:
+        st.dataframe(pd.DataFrame({
+            "Sport": summary["sport"],
+            "Sessions": summary["sessions"],
+            "Hours": summary["hours"].map(lambda h: f"{h:,.1f}"),
+            "Distance": summary["distance_km"].map(
+                lambda km: units.format_distance(km, 0) if km > 0 else "--"),
+            "Load": summary["load"].map(lambda x: f"{x:,.0f}"),
+            "Load per hour": (summary["load"] / summary["hours"]).map(lambda x: f"{x:.0f}"),
+            "Share of load": summary["load_share"].map(lambda x: f"{x:.0%}"),
+        }), hide_index=True, width="stretch")
+        st.caption("Load per hour is how hard each sport is for you on average: 100 is an "
+                   "hour at threshold.")
+
+    defaulted = other[other["load_method"] == METHOD_DEFAULT]
+    with st.expander("How sessions other than runs are scored"):
+        st.markdown(
+            "Each session is scored on the runs' scale, 100 points per hour at threshold, "
+            "with the best evidence it carries. **Heart rate**: the same Banister TRIMP the "
+            "runs use. **Power** (rides, with an FTP in the sidebar): "
+            "`hours x (power / FTP)^2 x 100`, from Strava's weighted average power, blended "
+            "50/50 with TRIMP when both exist. **Neither**: "
+            "`hours x IF^2 x 100` with an assumed intensity factor for the sport -- "
+            + ", ".join(f"{sport} {factor:.2f}" for sport, factor in DEFAULT_INTENSITY.items())
+            + f". {len(defaulted):,} of {len(other):,} sessions here fall back to that "
+            "assumption; recording heart rate replaces it with your own effort."
+        )
+        methods = (other.groupby(["sport", "load_method"]).size().unstack(fill_value=0))
+        st.dataframe(methods, width="stretch")
+        if data["ftp"] is None and other[["avg_watts", "weighted_watts"]].notna().any().any():
+            st.caption("Some rides carry power. Set your FTP in the sidebar to score them by it.")
+
+    with st.expander(f"All {len(other):,} sessions other than runs"):
+        recent = other.sort_values("date", ascending=False)
+        st.dataframe(pd.DataFrame({
+            "Date": recent["date"].dt.strftime("%Y-%m-%d"),
+            "Name": recent["name"],
+            "Type": recent["activity_type"],
+            "Time": recent["moving_time_s"].map(format_duration),
+            "Distance": recent["distance_km"].map(
+                lambda km: units.format_distance(km) if km > 0 else "--"),
+            "Avg HR": recent["avg_hr"].map(lambda h: f"{h:.0f}" if pd.notna(h) else "--"),
+            "Load": recent["load"].map(lambda x: f"{x:.0f}"),
+            "Scored by": recent["load_method"],
+        }), hide_index=True, width="stretch")
 
 
 def recovery_tab(data: dict, is_sample: bool) -> None:
@@ -1033,8 +1187,9 @@ def main() -> None:
     period_box = st.sidebar.container()  # filled once the runs are loaded
     units = choose_units()
     hr_rest, hr_max = choose_heart_rate()
+    include_other, ftp = choose_other_sports(path)
     fitted = choose_time_constants()
-    data = build_analytics(str(path), path.stat().st_mtime, hr_rest, hr_max)
+    data = build_analytics(str(path), path.stat().st_mtime, hr_rest, hr_max, include_other, ftp)
     data = apply_time_constants(data, fitted)
     all_activities = data["activities"]
     max_hr_hint(all_activities, hr_max)
@@ -1062,10 +1217,10 @@ def main() -> None:
     stream_data = (streams.restrict(all_streams, activities["activity_id"])
                    if all_streams is not None else None)
 
-    (overview, fitness, performance, heart_rate, consistency, run_detail, personal, gear,
-     recovery) = st.tabs(
+    (overview, fitness, performance, heart_rate, consistency, all_sports, run_detail, personal,
+     gear, recovery) = st.tabs(
         ["Overview", "Fitness & Freshness", "Performance", "Heart rate", "Consistency",
-         "Run detail", "Personal models", "Gear", "Sleep & HRV"]
+         "All sports", "Run detail", "Personal models", "Gear", "Sleep & HRV"]
     )
     with overview:
         overview_tab(data)
@@ -1077,6 +1232,8 @@ def main() -> None:
         heart_rate_tab(data, stream_data)
     with consistency:
         consistency_tab(data)
+    with all_sports:
+        sports_tab(data)
     with run_detail:
         run_detail_tab(data, stream_data, path)
     with personal:

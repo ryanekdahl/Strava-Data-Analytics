@@ -54,3 +54,17 @@ def test_route_map_with_and_without_street_tiles(app):
     _assert_clean(app)
     app.toggle(key="route_basemap").set_value(True).run()
     _assert_clean(app)
+
+
+def test_other_sports_tab_and_toggle(app):
+    assert any(tab.label == "All sports" for tab in app.tabs)
+    with_other = next(m for m in app.metric if m.label == "Fitness (CTL)").value
+    app.toggle(key="include_other").set_value(False).run()
+    _assert_clean(app)
+    runs_only = next(m for m in app.metric if m.label == "Fitness (CTL)").value
+    assert float(runs_only) < float(with_other)
+    app.toggle(key="include_other").set_value(True).run()
+    app.number_input(key="ftp").set_value(240).run()
+    app.radio(key="sport_stack").set_value("Training load").run()
+    _assert_clean(app)
+    app.number_input(key="ftp").set_value(0).run()

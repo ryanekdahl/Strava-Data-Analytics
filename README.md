@@ -23,12 +23,14 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has nine tabs — Overview, Fitness & Freshness,
-Performance, Heart rate, Consistency, Run detail, Personal models, Gear and Sleep & HRV —
+Python 3.11+. The dashboard has ten tabs — Overview, Fitness & Freshness,
+Performance, Heart rate, Consistency, All sports, Run detail, Personal models, Gear and
+Sleep & HRV —
 and a sidebar with a switch between the bundled sample data and your own export, a
 **period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
-custom range), **kilometres or miles**, your resting and max heart rate, and a choice
-between the standard and your fitted Fitness time constants.
+custom range), **kilometres or miles**, your resting and max heart rate, whether rides, swims and
+other sports count toward Fitness (plus a cycling FTP when rides carry power), and a
+choice between the standard and your fitted Fitness time constants.
 
 ## What it computes
 
@@ -39,6 +41,7 @@ between the standard and your fitted Fitness time constants.
 | **Performance** | Pace-vs-distance scatter with the best-effort frontier; true in-run best efforts and a pace curve from the GPS files; the PR table; Riegel race predictions with the standard or your fitted exponent; an interactive race-time calculator; recent form vs all-time best; and 30-day rolling pace and heart-rate trends |
 | **Heart rate** | Share of time in zones Z1–Z5 — second by second when the GPS files are present, compared against the average-HR shortcut — monthly hours by zone, and each zone's bpm range |
 | **Consistency** | Weekly distance, hours and run counts, monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
+| **All sports** | Rides, swims, walks and gym sessions on the same load scale as runs: weekly hours or load stacked by sport, each sport's share of load and load per hour, and how every session was scored |
 | **Run detail** | Any run's route coloured by pace or heart rate, its per-kilometre (or per-mile) pace, heart rate, cadence and elevation, and its aerobic decoupling |
 | **Personal models** | Your own Riegel exponent with a 95% interval, and Banister fitness–fatigue time constants fitted to your runs, with a bootstrap interval, the fit surface, and what one hard session does day by day |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
@@ -241,6 +244,30 @@ The model is checked by simulation in the tests: from load and performances gene
 with τ1 = 30 and τ2 = 9 plus noise and a pre-export head start, the fit recovers both
 constants and the head start.
 
+### Other sports — `src/sports.py`
+
+Fitness and Fatigue belong to the body, not the sport, so by default every non-run
+session in the export adds to the daily load behind CTL, ATL, Form, ACWR and the
+Banister fit. A sidebar switch leaves them out. Each session is scored on the runs'
+scale of 100 points per threshold hour, using the best evidence it has:
+
+```
+heart rate:   TRIMP, exactly as for runs
+power:        TSS = duration_hours × (power / FTP)² × 100        (rides, FTP set)
+both:         50/50 blend, as pace and heart rate are for runs
+neither:      duration_hours × IF_sport² × 100
+```
+
+Power uses Strava's `Weighted Average Power` where present, since it is a normalized
+power, and falls back to `Average Watts`. It counts only for rides: watts on a rowing
+or ski erg are not on the cycling FTP scale. The default intensity factors are
+assumptions, stated rather than hidden: ride 0.65, swim 0.70, walk 0.40, hike 0.55,
+strength 0.60, row 0.70, ski 0.60, yoga 0.35, cardio machine 0.60, anything else
+0.55. Strava's activity types are folded into these families, so `Virtual Ride` and
+`Gravel Ride` are both rides. Unlike runs, a session with no distance (a gym session)
+is kept. Every run-specific view — pace, best efforts, Riegel, zones, shoes — still
+uses runs only.
+
 ### Shoe mileage — `src/gear.py`
 
 Distance per shoe from the `Activity Gear` column, with a retirement slider (default
@@ -384,6 +411,11 @@ exercised by the sample rather than bypassed.
 - **Weather is ignored, and elevation only partly handled.** Where the export has
   Strava's grade-adjusted distance, hills are accounted for in the load score;
   otherwise only heart rate picks up the difference. Heat is never adjusted for.
+- **Other sports without heart rate or power are scored by assumption.** The
+  per-sport intensity factors are reasonable averages, not your effort; a hard spin
+  class and an easy commute score the same. The All sports tab says how many sessions
+  fell back to them. Heart rate also reads low in the pool and in strength work, so
+  TRIMP undercounts both.
 
 ## Repository layout
 
@@ -404,6 +436,7 @@ exercised by the sample rather than bypassed.
 │   ├── heart_rate.py           # HR-reserve zones, time in zone (average HR or streams)
 │   ├── streams.py              # GPX/TCX/FIT parsing, in-run bests, splits, cache
 │   ├── personal_models.py      # personal Riegel exponent, fitted Banister model
+│   ├── sports.py               # rides, swims, gym... scored on the runs' load axis
 │   ├── gear.py                 # shoe mileage and retirement
 │   ├── units.py                # kilometres / miles display conversion
 │   ├── recovery.py             # sleep / HRV import and correlations
@@ -425,8 +458,11 @@ sample also carries the newer export columns (max heart rate, per-leg cadence,
 grade-adjusted distance, Relative Effort, shoes) and a gzipped GPX recording per run,
 with intervals inside tempo sessions, fast finishes inside long runs, hills, a lagging
 heart rate and stops at crossings. Those extras draw on a separate per-activity
-random stream. It also writes a few rides, walks and one zero-distance row, so
-the loader's filtering and cleaning are exercised by the sample data.
+random stream. Cross-training comes from its own random stream too: a gym session most
+weeks, weekend rides (some indoors, some with a power meter at a 240 W FTP), the odd
+swim and walk, and more riding and swimming through the injury breaks. There is also
+a zero-distance run, so the loader's filtering and cleaning are exercised by the
+sample data.
 
 ### Tests
 

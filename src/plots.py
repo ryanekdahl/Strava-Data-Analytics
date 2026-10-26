@@ -718,3 +718,58 @@ def gear_figure(gear: pd.DataFrame, retire_km: float, units: Units = METRIC) -> 
           x_title=f"Distance ({units.distance_label})")
     fig.update_yaxes(gridcolor="rgba(0,0,0,0)")
     return fig
+
+
+# Fixed hue per sport, in categorical order, so a sport keeps its colour
+# whichever others the period contains.  Green is skipped: it is the "good"
+# status colour on the ACWR chart.  Sports beyond these share muted grey.
+SPORT_COLORS = {
+    "Run": "#2a78d6", "Ride": "#eb6834", "Swim": "#1baf7a", "Strength": "#eda100",
+    "Walk": "#e87ba4", "Hike": "#6250d6", "Row": "#e34948",
+}
+
+
+def _sport_order(sports) -> list[str]:
+    """The palette's order first, then any other sport alphabetically."""
+    present = set(sports)
+    return ([s for s in SPORT_COLORS if s in present]
+            + sorted(present - set(SPORT_COLORS)))
+
+
+def sport_weekly_figure(weekly: pd.DataFrame, value: str = "hours") -> go.Figure:
+    """Hours (or load) per calendar week, stacked by sport, runs at the bottom."""
+    label = {"hours": ("Hours per week by sport", "Hours", "{y:.1f} h"),
+             "load": ("Training load per week by sport", "Load points", "{y:.0f} points")}
+    title, y_title, fmt = label[value]
+    fig = go.Figure()
+    for sport in _sport_order(weekly["sport"]):
+        frame = weekly[weekly["sport"] == sport]
+        fig.add_trace(go.Bar(
+            x=frame["week_start"], y=frame[value], name=sport,
+            marker=dict(color=SPORT_COLORS.get(sport, MUTED), line=dict(width=2, color=SURFACE)),
+            hovertemplate=f"{sport}: %{fmt}<extra></extra>",
+        ))
+    fig.update_layout(title=title, barmode="stack", bargap=0.2)
+    fig.update_xaxes(hoverformat="Week of %d %b %Y")
+    return _base(fig, height=380, y_title=y_title)
+
+
+def sport_load_figure(summary: pd.DataFrame) -> go.Figure:
+    """Each sport's share of total training load, largest at the top."""
+    ordered = summary.sort_values("load")
+    fig = go.Figure(go.Bar(
+        y=ordered["sport"], x=ordered["load_share"] * 100.0, orientation="h",
+        marker=dict(color=[SPORT_COLORS.get(s, MUTED) for s in ordered["sport"]],
+                    cornerradius=4),
+        text=[f"{share:.0%}" for share in ordered["load_share"]], textposition="outside",
+        textfont=dict(color=INK_SECONDARY),
+        customdata=np.stack([ordered["sessions"], ordered["hours"]], axis=-1),
+        hovertemplate=("%{y}: %{x:.0f}% of load<br>%{customdata[0]} sessions, "
+                       "%{customdata[1]:.1f} h<extra></extra>"),
+    ))
+    fig.update_layout(title="Share of training load", showlegend=False, hovermode="closest",
+                      bargap=0.3)
+    _base(fig, height=max(240, 90 + 46 * len(ordered)), x_title="Share of load (%)")
+    fig.update_xaxes(range=[0, max(float(ordered["load_share"].max()) * 118.0, 10.0)])
+    fig.update_yaxes(gridcolor="rgba(0,0,0,0)", tickfont=dict(color=INK_SECONDARY))
+    return fig

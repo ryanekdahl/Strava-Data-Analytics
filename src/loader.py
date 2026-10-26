@@ -34,6 +34,11 @@ columns.  Every one is always present and simply empty when the export lacks it:
 ``filename``             str, nullable -- path of the run's GPS file inside the
                          export, e.g. ``activities/123.fit.gz``
 =======================  =====================================================
+
+Everything that is *not* a run -- rides, swims, walks, strength sessions -- is
+read by :func:`load_other_activities` into a smaller frame (see
+:data:`OTHER_COLUMNS`), which :mod:`src.sports` scores so it can count toward
+Fitness and Fatigue.
 """
 
 from __future__ import annotations
@@ -73,6 +78,24 @@ EXTRA_COLUMNS = [
 
 TIDY_COLUMNS = CONTRACT_COLUMNS + EXTRA_COLUMNS
 
+# The non-run frame: ``activity_type`` is Strava's own label ("Ride", "Weight
+# Training", ...); ``distance_km`` is 0 for sessions that cover no ground, and
+# the power columns are empty for anything recorded without a power meter.
+OTHER_COLUMNS = [
+    "activity_id",
+    "date",
+    "name",
+    "activity_type",
+    "distance_km",
+    "moving_time_s",
+    "avg_hr",
+    "max_hr",
+    "elevation_gain_m",
+    "avg_watts",
+    "weighted_watts",
+    "relative_effort",
+]
+
 # Candidate source columns, most trustworthy first.  Strava repeats "Distance";
 # the duplicate (read as "Distance.1") is the meters column, so prefer it.
 _CANDIDATES = {
@@ -91,6 +114,8 @@ _CANDIDATES = {
     "relative_effort": ("Relative Effort.1", "Relative Effort", "relative_effort", "suffer_score"),
     "gear": ("Activity Gear", "gear"),
     "filename": ("Filename", "filename"),
+    "avg_watts": ("Average Watts", "Average Watts.1", "average_watts"),
+    "weighted_watts": ("Weighted Average Power", "weighted_average_watts"),
 }
 
 # A distance series whose typical value exceeds this is read as meters, not km.
@@ -163,30 +188,22 @@ def _optional_text(series: pd.Series | None, index: pd.Index) -> pd.Series:
     return text.mask(text == "")
 
 
-def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
-    """Read a Strava ``activities.csv`` and return the tidy run-level frame.
-
-    Runs are kept, everything else is filtered out, unusable rows (no date,
-    non-positive distance or moving time) are dropped, and the number dropped
-    is logged.  The frame is sorted by date with a fresh ``RangeIndex``.
-    """
-    path = Path(path)
+def _read_export(path: Path) -> pd.DataFrame:
     raw = pd.read_csv(path)
     raw.columns = [str(column).strip() for column in raw.columns]
-    n_read = len(raw)
+    return raw
 
+
+def _is_run(raw: pd.DataFrame) -> pd.Series | None:
+    """``True`` for runs, or ``None`` when the export has no activity-type column."""
     activity_type = _pick(raw, "activity_type")
-    if activity_type is not None:
-        is_run = activity_type.astype("string").str.strip().str.casefold() == "run"
-        raw = raw[is_run.fillna(False)]
-        LOGGER.info("Kept %d runs out of %d activities.", len(raw), n_read)
-    n_runs = len(raw)
+    if activity_type is None:
+        return None
+    return (activity_type.astype("string").str.strip().str.casefold() == "run").fillna(False)
 
-    distance = _coerce_numeric(_pick(raw, "distance"))
-    if distance is None:
-        raise ValueError(f"{path}: no recognizable distance column in {list(raw.columns)}")
-    distance_km = _to_kilometers(distance)
 
+def _durations(raw: pd.DataFrame, path: Path) -> tuple[pd.Series, pd.Series]:
+    """Moving and elapsed seconds, each standing in for the other when missing."""
     moving_time_s = _coerce_seconds(_pick(raw, "moving_time"))
     elapsed_time_s = _coerce_seconds(_pick(raw, "elapsed_time"))
     if moving_time_s is None and elapsed_time_s is None:
@@ -195,44 +212,82 @@ def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
         moving_time_s = elapsed_time_s
     if elapsed_time_s is None:
         elapsed_time_s = moving_time_s
+    return moving_time_s, elapsed_time_s
 
+
+def _dates(raw: pd.DataFrame, path: Path) -> pd.Series:
     raw_date = _pick(raw, "date")
     if raw_date is None:
         raise ValueError(f"{path}: no recognizable date column in {list(raw.columns)}")
     date = pd.to_datetime(raw_date, format="mixed", errors="coerce")
     if isinstance(date.dtype, pd.DatetimeTZDtype):  # normalize to tz-naive local
         date = date.dt.tz_localize(None)
+    return date
 
+
+def _ids(raw: pd.DataFrame) -> pd.Series:
     activity_id = _coerce_numeric(_pick(raw, "activity_id"))
     if activity_id is None:
         activity_id = pd.Series(np.arange(len(raw), dtype="float64"), index=raw.index)
+    return activity_id
 
+
+def _names(raw: pd.DataFrame) -> pd.Series:
     name = _pick(raw, "name")
     name = pd.Series([""] * len(raw), index=raw.index) if name is None else name
+    return name.astype("string").fillna("").astype(str)
+
+
+def _numeric_or_nan(raw: pd.DataFrame, key: str) -> pd.Series:
+    values = _coerce_numeric(_pick(raw, key))
+    if values is None:
+        return pd.Series(np.nan, index=raw.index, dtype="float64")
+    return values.astype("float64")
+
+
+def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
+    """Read a Strava ``activities.csv`` and return the tidy run-level frame.
+
+    Runs are kept, everything else is filtered out, unusable rows (no date,
+    non-positive distance or moving time) are dropped, and the number dropped
+    is logged.  The frame is sorted by date with a fresh ``RangeIndex``.
+    """
+    path = Path(path)
+    raw = _read_export(path)
+    n_read = len(raw)
+
+    is_run = _is_run(raw)
+    if is_run is not None:
+        raw = raw[is_run]
+        LOGGER.info("Kept %d runs out of %d activities.", len(raw), n_read)
+    n_runs = len(raw)
+
+    distance = _coerce_numeric(_pick(raw, "distance"))
+    if distance is None:
+        raise ValueError(f"{path}: no recognizable distance column in {list(raw.columns)}")
+    distance_km = _to_kilometers(distance)
+
+    moving_time_s, elapsed_time_s = _durations(raw, path)
 
     nan_column = pd.Series(np.nan, index=raw.index, dtype="float64")
-    avg_hr = _coerce_numeric(_pick(raw, "avg_hr"))
-    elevation_gain_m = _coerce_numeric(_pick(raw, "elevation_gain"))
-    max_hr = _coerce_numeric(_pick(raw, "max_hr"))
     cadence = _coerce_numeric(_pick(raw, "cadence"))
     grade_adjusted = _coerce_numeric(_pick(raw, "grade_adjusted_distance"))
-    relative_effort = _coerce_numeric(_pick(raw, "relative_effort"))
 
     tidy = pd.DataFrame(
         {
-            "activity_id": activity_id,
-            "date": date,
-            "name": name.astype("string").fillna("").astype(str),
+            "activity_id": _ids(raw),
+            "date": _dates(raw, path),
+            "name": _names(raw),
             "distance_km": distance_km.astype("float64"),
             "moving_time_s": moving_time_s,
             "elapsed_time_s": elapsed_time_s,
-            "avg_hr": nan_column if avg_hr is None else avg_hr,
-            "elevation_gain_m": nan_column if elevation_gain_m is None else elevation_gain_m,
-            "max_hr": nan_column if max_hr is None else max_hr,
+            "avg_hr": _numeric_or_nan(raw, "avg_hr"),
+            "elevation_gain_m": _numeric_or_nan(raw, "elevation_gain"),
+            "max_hr": _numeric_or_nan(raw, "max_hr"),
             "avg_cadence_spm": nan_column if cadence is None else _to_steps_per_minute(cadence),
             "grade_adjusted_km": (nan_column if grade_adjusted is None
                                   else _to_kilometers(grade_adjusted)),
-            "relative_effort": nan_column if relative_effort is None else relative_effort,
+            "relative_effort": _numeric_or_nan(raw, "relative_effort"),
             "gear": _optional_text(_pick(raw, "gear"), raw.index),
             "filename": _optional_text(_pick(raw, "filename"), raw.index),
         }
@@ -272,6 +327,49 @@ def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
 
     tidy = tidy.sort_values("date").reset_index(drop=True)
     return tidy[TIDY_COLUMNS]
+
+
+def load_other_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
+    """Every activity in the export that is not a run, in the :data:`OTHER_COLUMNS` frame.
+
+    Unlike runs, a session with no distance is kept -- a strength session or a
+    yoga class covers no ground but is still training.  Rows with no date, no
+    id or no moving time are dropped.  An export without an activity-type
+    column is read as all runs, so this returns an empty frame for it.
+    """
+    path = Path(path)
+    raw = _read_export(path)
+    is_run = _is_run(raw)
+    raw = raw.iloc[0:0] if is_run is None else raw[~is_run]
+
+    distance = _coerce_numeric(_pick(raw, "distance"))
+    distance_km = (pd.Series(0.0, index=raw.index) if distance is None
+                   else _to_kilometers(distance).fillna(0.0).clip(lower=0.0))
+    moving_time_s, _ = _durations(raw, path)
+    activity_type = _optional_text(_pick(raw, "activity_type"), raw.index).fillna("Other")
+
+    other = pd.DataFrame({
+        "activity_id": _ids(raw),
+        "date": _dates(raw, path),
+        "name": _names(raw),
+        "activity_type": activity_type.astype(str),
+        "distance_km": distance_km.astype("float64"),
+        "moving_time_s": moving_time_s,
+        "avg_hr": _numeric_or_nan(raw, "avg_hr"),
+        "max_hr": _numeric_or_nan(raw, "max_hr"),
+        "elevation_gain_m": _numeric_or_nan(raw, "elevation_gain"),
+        "avg_watts": _numeric_or_nan(raw, "avg_watts"),
+        "weighted_watts": _numeric_or_nan(raw, "weighted_watts"),
+        "relative_effort": _numeric_or_nan(raw, "relative_effort"),
+    })
+    usable = (other["date"].notna() & other["activity_id"].notna()
+              & other["moving_time_s"].gt(0))
+    other = other[usable].copy()
+    other["activity_id"] = other["activity_id"].astype("int64")
+    other["moving_time_s"] = other["moving_time_s"].round().astype("int64")
+    for column in ("avg_watts", "weighted_watts"):
+        other[column] = other[column].where(other[column] > 0)
+    return other.sort_values("date").reset_index(drop=True)[OTHER_COLUMNS]
 
 
 def find_real_export(raw_dir: str | Path = RAW_DIR) -> Path | None:

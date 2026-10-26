@@ -26,6 +26,10 @@ What the simulation models
 * **The columns recent exports carry**: max heart rate, cadence (per leg, as
   Strava writes it), grade-adjusted distance, Relative Effort, the shoe each run
   was logged in, and the ``Filename`` of its GPS recording.
+* **Cross-training**: a gym session most weeks, weekend rides (some with a
+  power meter, some on an indoor trainer), the odd swim and walk -- and more
+  riding and swimming through the injury gaps, when the runner could not run.
+  These come from their own RNG stream, so they did not change any run.
 * **A GPS recording per run** (``activities/<id>.gpx.gz``, as in a real export):
   intervals hidden inside tempo sessions, fast finishes inside long runs, hills,
   a lagging heart rate and the odd stop at a crossing.  These recordings are what
@@ -88,6 +92,8 @@ CSV_COLUMNS = [
     "Elevation Gain",
     "Average Cadence",
     "Grade Adjusted Distance",
+    "Average Watts",
+    "Weighted Average Power",
 ]
 
 # Daily trainers are replaced every ~750 km; fast sessions use a racing shoe.
@@ -97,6 +103,16 @@ RACER = "Nike Vaporfly 3"
 
 # The simulated athlete's true heart-rate settings, used for Relative Effort.
 TRUE_HR_REST, TRUE_HR_MAX = 52.0, 192.0
+
+# Cross-training: the simulated athlete's cycling FTP, and per-week chances of
+# each session in a normal week and in a week off running.
+TRUE_FTP = 240.0
+CROSS_TRAINING = {  # sport: (chance in a training week, chance in a gap week)
+    "Weight Training": (0.55, 0.70),
+    "Ride": (0.40, 0.95),
+    "Swim": (0.12, 0.80),
+    "Walk": (0.20, 0.50),
+}
 
 STREAM_SAMPLE_S = 5.0  # seconds between GPS points, like a watch's smart recording
 START_LAT, START_LON = 51.5007, -0.1246
@@ -255,15 +271,24 @@ def _rows(end_date: date, rng: np.random.Generator, seed: int = 0) -> list[dict]
             # Occasional cross-training and a rare corrupt row, as real exports have.
             if rng.random() < 0.06:
                 activity_id += 1
+                kind = str(rng.choice(["Ride", "Walk", "Workout"]))
+                elapsed = int(rng.integers(1800, 5400))
+                distance_m = round(rng.uniform(5000, 40000), 1)
+                moving = int(rng.integers(1500, 5000))
+                if kind == "Walk":  # same draws as ever, at a walking speed
+                    distance_m = round(moving * 1.4, 1)
+                elif kind == "Workout":
+                    distance_m = 0.0
                 rows.append(
                     {
                         "Activity ID": activity_id,
                         "Activity Date": started + timedelta(days=1, hours=2),
-                        "Activity Name": "Recovery Spin",
-                        "Activity Type": str(rng.choice(["Ride", "Walk", "Workout"])),
-                        "Elapsed Time": int(rng.integers(1800, 5400)),
-                        "Distance": round(rng.uniform(5000, 40000), 1),
-                        "Moving Time": int(rng.integers(1500, 5000)),
+                        "Activity Name": {"Ride": "Recovery Spin", "Walk": "Recovery Walk",
+                                          "Workout": "Mobility Session"}[kind],
+                        "Activity Type": kind,
+                        "Elapsed Time": elapsed,
+                        "Distance": distance_m,
+                        "Moving Time": moving,
                         "Average Heart Rate": round(rng.uniform(105, 140)),
                         "Elevation Gain": round(rng.uniform(10, 300)),
                     }
@@ -286,6 +311,91 @@ def _rows(end_date: date, rng: np.random.Generator, seed: int = 0) -> list[dict]
     return rows
 
 
+def _cross_training_rows(end_date: date, seed: int) -> list[dict]:
+    """Gym sessions, rides, swims and walks, from an RNG of their own.
+
+    More riding and swimming in the weeks the runner was not running, as an
+    injured runner does.  Heart rate is sometimes missing and some rides carry
+    power, so every branch of :func:`src.sports.compute_other_load` is used.
+    """
+    aux = np.random.default_rng([seed, 3])
+    first_monday = end_date - timedelta(days=end_date.weekday() + 7 * (N_WEEKS - 1))
+    activity_id = 4_200_000_000
+    rows: list[dict] = []
+    for week in range(N_WEEKS):
+        gap = week in GAP_WEEKS
+        week_start = first_monday + timedelta(weeks=week)
+        for sport, chances in CROSS_TRAINING.items():
+            for _ in range(2 if gap and sport in ("Ride", "Swim") else 1):
+                if aux.random() >= chances[gap]:
+                    continue
+                activity_id += 1
+                day = int(aux.choice([5, 6]) if sport == "Ride" and not gap
+                          else aux.integers(0, 7))
+                started = datetime.combine(week_start + timedelta(days=day),
+                                           datetime.min.time()) + timedelta(
+                    hours=int(aux.integers(7, 19)), minutes=int(aux.integers(0, 60)))
+                rows.append({"Activity ID": activity_id, "Activity Date": started,
+                             **_cross_session(sport, gap, aux)})
+    return rows
+
+
+def _cross_session(sport: str, gap: bool, aux: np.random.Generator) -> dict:
+    """The CSV columns for one cross-training session of ``sport``."""
+    hr_mean, watts = None, None
+    if sport == "Weight Training":
+        moving = int(aux.integers(40, 70)) * 60
+        distance, climb, name = 0.0, "", str(aux.choice(["Gym - Legs", "Gym - Upper Body",
+                                                         "Strength & Core"]))
+        hr_mean = aux.uniform(100, 120)
+    elif sport == "Ride":
+        indoor = aux.random() < 0.3
+        moving = int(aux.integers(45, 90) if indoor else aux.integers(60, 180)) * 60
+        intensity = aux.uniform(0.62, 0.82) if not gap else aux.uniform(0.65, 0.88)
+        speed_kmh = 20.0 + 14.0 * intensity + aux.normal(0.0, 1.5)
+        distance = moving / 3600.0 * speed_kmh * 1000.0
+        climb = 0.0 if indoor else round(distance / 1000.0 * aux.uniform(4, 15))
+        name = "Zwift - Watopia" if indoor else str(aux.choice(["Morning Ride", "Weekend Ride",
+                                                                "Coffee Ride"]))
+        hr_mean = 112.0 + 55.0 * (intensity - 0.55)
+        if indoor or aux.random() < 0.5:
+            watts = TRUE_FTP * intensity
+        sport = "Virtual Ride" if indoor else sport
+    elif sport == "Swim":
+        moving = int(aux.integers(30, 55)) * 60
+        distance = moving / 60.0 * aux.uniform(40, 52)  # metres a minute
+        climb, name = "", "Pool Swim"
+        hr_mean = aux.uniform(120, 145) if aux.random() < 0.3 else None  # wrist HR in water
+    else:  # Walk
+        moving = int(aux.integers(30, 75)) * 60
+        distance = moving * aux.uniform(1.25, 1.5)
+        climb, name = round(distance / 1000.0 * aux.uniform(2, 10)), "Lunch Walk"
+        hr_mean = aux.uniform(90, 108)
+    has_hr = hr_mean is not None and aux.random() > 0.1
+    return {
+        "Activity Name": name,
+        "Activity Type": sport,
+        "Elapsed Time": int(moving * aux.uniform(1.0, 1.15)),
+        "Distance": round(distance, 1),
+        "Moving Time": moving,
+        "Average Heart Rate": round(hr_mean) if has_hr else "",
+        "Max Heart Rate": round(hr_mean + aux.uniform(15, 35)) if has_hr else "",
+        "Elevation Gain": climb,
+        "Average Watts": round(watts * aux.uniform(0.88, 0.95)) if watts else "",
+        "Weighted Average Power": round(watts) if watts else "",
+    }
+
+
+def sample_is_current(path: str | Path = SAMPLE_CSV) -> bool:
+    """Whether ``path`` was written by this version of the generator (same columns)."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            header = handle.readline().strip()
+    except OSError:
+        return False
+    return header == ",".join(CSV_COLUMNS)
+
+
 def generate_sample(
     out_path: str | Path = SAMPLE_CSV,
     seed: int = 20240921,
@@ -299,12 +409,13 @@ def generate_sample(
     """
     rng = np.random.default_rng(seed)
     end_date = end_date or date.today()
-    frame = pd.DataFrame(_rows(end_date, rng, seed))
+    frame = pd.DataFrame(_rows(end_date, rng, seed) + _cross_training_rows(end_date, seed))
     # The final training week can spill past today; a real export never does.
     frame = frame[frame["Activity Date"] <= pd.Timestamp(end_date) + pd.Timedelta(days=1)]
     frame = frame.sort_values("Activity Date").reset_index(drop=True)
     extras = ["Max Heart Rate", "Relative Effort", "Activity Gear", "Filename",
-              "Average Cadence", "Grade Adjusted Distance"]
+              "Average Cadence", "Grade Adjusted Distance", "Average Watts",
+              "Weighted Average Power"]
     frame[extras] = frame[extras].astype(object).fillna("")  # decoys never got them
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -478,7 +589,8 @@ def main() -> None:
 
     frame = generate_sample(args.out, seed=args.seed, write_streams=not args.no_streams)
     runs = frame[frame["Activity Type"] == "Run"]
-    print(f"Wrote {len(frame)} activities ({len(runs)} runs) to {args.out}")
+    print(f"Wrote {len(frame)} activities ({len(runs)} runs, "
+          f"{len(frame) - len(runs)} other sports) to {args.out}")
     print(f"Date range: {frame['Activity Date'].iloc[0]} -> {frame['Activity Date'].iloc[-1]}")
 
 

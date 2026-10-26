@@ -195,3 +195,23 @@ def test_synthetic_sample_carries_the_extra_columns(sample_runs):
     assert sample_runs["avg_cadence_spm"].between(140, 200).all()
     # Hills make grade-adjusted pace faster than raw pace, never slower.
     assert (sample_runs["gap_pace_min_per_km"] <= sample_runs["pace_min_per_km"]).all()
+
+
+def test_other_activities_keep_sessions_without_distance(tmp_path):
+    from src.loader import OTHER_COLUMNS, load_other_activities
+    csv = tmp_path / "activities.csv"
+    pd.DataFrame({
+        "Activity ID": [1, 2, 3, 4],
+        "Activity Date": ["Jan 1, 2025, 7:00:00 AM"] * 4,
+        "Activity Name": ["Run", "Gym", "Ride", "Broken"],
+        "Activity Type": ["Run", "Weight Training", "Ride", "Swim"],
+        "Distance": [10000.0, 0.0, 40000.0, 1500.0],
+        "Moving Time": [3000, 2700, 5400, 0],
+        "Weighted Average Power": ["", "", "210", ""],
+    }).to_csv(csv, index=False)
+    other = load_other_activities(csv)
+    assert list(other.columns) == OTHER_COLUMNS
+    assert other["activity_type"].tolist() == ["Weight Training", "Ride"]
+    assert other["distance_km"].tolist() == [0.0, 40.0]
+    assert other["weighted_watts"].tolist()[1] == 210.0
+    assert len(load_activities(csv)) == 1
