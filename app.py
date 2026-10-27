@@ -225,8 +225,10 @@ def restrict_period(data: dict, start: pd.Timestamp, end: pd.Timestamp) -> dict:
     keep the whole history (the personal models need every run they can get),
     the non-run ``other`` sessions and the combined ``sessions`` are cut too,
     and ``all_activities`` keeps every run for the shoe-mileage tab.
+    ``previous`` holds the runs of the equally long window just before the
+    period, for the Overview's comparison (``None`` when there is no such window).
     """
-    data = {**data, "all_activities": data["activities"]}
+    data = {**data, "all_activities": data["activities"], "previous": None}
     activities = data["activities"]
     if activities.empty or (activities["date"].min() >= start
                             and activities["date"].max() < end):
@@ -239,6 +241,7 @@ def restrict_period(data: dict, start: pd.Timestamp, end: pd.Timestamp) -> dict:
     hr_rest, hr_max = data["hr_rest"], data["hr_max"]
     return {
         **data,
+        "previous": previous_period_runs(activities, start, end),
         "activities": runs,
         "scored": cut(data["scored"]),
         "other": cut(data["other"]),
@@ -252,6 +255,29 @@ def restrict_period(data: dict, start: pd.Timestamp, end: pd.Timestamp) -> dict:
         "zones": zone_distribution(runs, hr_rest, hr_max),
         "monthly_zones": monthly_zone_hours(runs, hr_rest, hr_max),
     }
+
+
+def previous_period_runs(activities: pd.DataFrame, start: pd.Timestamp,
+                         end: pd.Timestamp) -> pd.DataFrame | None:
+    """The runs in the window of the same length just before ``start``.
+
+    A calendar year compares with the year before it.  ``None`` when that window
+    starts before the export does, since a half-recorded window would make any
+    period look like a big step up.
+    """
+    if start.is_year_start and end == start + pd.DateOffset(years=1):
+        prev_start = start - pd.DateOffset(years=1)
+    else:
+        prev_start = start - (end - start)
+    if prev_start < activities["date"].min().normalize():
+        return None
+    dates = activities["date"]
+    return activities[(dates >= prev_start) & (dates < start)].reset_index(drop=True)
+
+
+def period_delta(now: float, before: float, unit: str = "") -> str:
+    """A metric delta like ``+12 km vs previous period``."""
+    return f"{now - before:+,.0f}{unit} vs previous period"
 
 
 def choose_heart_rate() -> tuple[float, float]:
@@ -334,10 +360,23 @@ def overview_tab(data: dict) -> None:
     latest_acwr = acwr["acwr"].dropna()
     acwr_value = float(latest_acwr.iloc[-1]) if not latest_acwr.empty else float("nan")
 
+    previous = data.get("previous")
+    deltas = {"distance": None, "runs": None, "hours": None}
+    if previous is not None:
+        before = summary_kpis(previous)
+        deltas = {
+            "distance": period_delta(units.distance(kpis["total_distance_km"]),
+                                     units.distance(before["total_distance_km"]),
+                                     f" {units.distance_label}"),
+            "runs": period_delta(kpis["total_runs"], before["total_runs"]),
+            "hours": period_delta(kpis["total_hours"], before["total_hours"], " h"),
+        }
+
     top = st.columns(4)
-    top[0].metric("Total distance", units.format_distance(kpis["total_distance_km"], 0))
-    top[1].metric("Runs recorded", f"{kpis['total_runs']:,}")
-    top[2].metric("Time on feet", f"{kpis['total_hours']:,.0f} h")
+    top[0].metric("Total distance", units.format_distance(kpis["total_distance_km"], 0),
+                  delta=deltas["distance"])
+    top[1].metric("Runs recorded", f"{kpis['total_runs']:,}", delta=deltas["runs"])
+    top[2].metric("Time on feet", f"{kpis['total_hours']:,.0f} h", delta=deltas["hours"])
     top[3].metric("Weeks tracked", f"{kpis['weeks']:,}")
 
     week_ago = fitness.iloc[-8] if len(fitness) > 8 else fitness.iloc[0]

@@ -49,6 +49,16 @@ def test_a_period_narrows_the_runs(app):
     app.selectbox(key="period").set_value("All time").run()
 
 
+def test_a_period_compares_with_the_one_before(app):
+    distance = next(m for m in app.metric if m.label == "Total distance")
+    assert not distance.delta  # all time has nothing before it
+    app.selectbox(key="period").set_value("Last 3 months").run()
+    _assert_clean(app)
+    distance = next(m for m in app.metric if m.label == "Total distance")
+    assert distance.delta.endswith(" km vs previous period")
+    app.selectbox(key="period").set_value("All time").run()
+
+
 def test_route_map_with_and_without_street_tiles(app):
     app.radio(key="route_color").set_value("Heart rate").run()
     _assert_clean(app)

@@ -36,7 +36,7 @@ choice between the standard and your fitted Fitness time constants.
 
 | Tab | What you get |
 |---|---|
-| **Overview** | Total distance, runs, hours and weeks tracked; current Fitness, Form and ACWR with a plain-English reading of each |
+| **Overview** | Total distance, runs, hours and weeks tracked (with the change from the previous period of the same length when a period is picked); current Fitness, Form and ACWR with a plain-English reading of each |
 | **Fitness & Freshness** | CTL / ATL / TSB over time (standard or fitted time constants), the exact load formula behind the curve, and a check of the load score against Strava's own Relative Effort |
 | **Performance** | Pace-vs-distance scatter with the best-effort frontier; true in-run best efforts and a pace curve from the GPS files; the PR table; Riegel race predictions with the standard or your fitted exponent; an interactive race-time calculator; recent form vs all-time best; and 30-day rolling pace and heart-rate trends |
 | **Heart rate** | Share of time in zones Z1–Z5 — second by second when the GPS files are present, compared against the average-HR shortcut — monthly hours by zone, and each zone's bpm range |
