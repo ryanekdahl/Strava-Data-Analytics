@@ -23,10 +23,10 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has ten tabs — Overview, Fitness & Freshness,
-Performance, Heart rate, Consistency, All sports, Run detail, Personal models, Gear and
-Sleep & HRV —
-and a sidebar with a switch between the bundled sample data and your own export, a
+Python 3.11+. The dashboard has eleven tabs — Overview, Fitness & Freshness,
+Performance, Heart rate, Consistency, All sports, Run detail, Personal models, Gear,
+Sleep & HRV and Share — and a sidebar with a switch between the bundled sample data and
+your own export, a
 **period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
 custom range), **kilometres or miles**, your resting and max heart rate, whether rides, swims and
 other sports count toward Fitness (plus a cycling FTP when rides carry power), and a
@@ -46,6 +46,7 @@ choice between the standard and your fitted Fitness time constants.
 | **Personal models** | Your own Riegel exponent with a 95% interval, and Banister fitness–fatigue time constants fitted to your runs, with a bootstrap interval, the fit surface, and what one hard session does day by day |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 | **Sleep & HRV** | Import a sleep-score / HRV CSV (Whoop, Oura, Garmin or the template) and see how each morning's reading correlates with the previous day's load, Fatigue and Form — see `src/recovery.py` |
+| **Share** | A Strava-style sticker for an Instagram story: the period's or one run's headline stats (and the route) on a transparent PNG, copied to the clipboard or downloaded — see `src/sticker.py` |
 
 ## Methodology
 

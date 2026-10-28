@@ -78,3 +78,14 @@ def test_other_sports_tab_and_toggle(app):
     app.radio(key="sport_stack").set_value("Training load").run()
     _assert_clean(app)
     app.number_input(key="ftp").set_value(0).run()
+
+
+def test_share_tab_makes_period_and_run_stickers(app):
+    assert any(tab.label == "Share" for tab in app.tabs)
+    app.multiselect(key="sticker_stats_This period").set_value(["Distance", "Fitness"]).run()
+    _assert_clean(app)
+    app.radio(key="sticker_kind").set_value("One run").run()
+    _assert_clean(app)
+    app.radio(key="sticker_ink").set_value("Black").run()
+    _assert_clean(app)
+    app.radio(key="sticker_kind").set_value("This period").run()

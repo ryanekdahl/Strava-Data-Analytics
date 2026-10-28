@@ -22,10 +22,12 @@ Methodology section for the formulas behind Fitness, Form, ACWR and Riegel.
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from src import plots, streams
 from src.consistency import (
@@ -56,6 +58,7 @@ from src.sports import (
     DEFAULT_INTENSITY, METHOD_DEFAULT, all_sessions, compute_other_load, sport_summary,
     weekly_sport_hours,
 )
+from src.sticker import INKS, png_size, render_sticker
 from src.race_calculator import (
     CALCULATOR_DISTANCES, EXPONENT_RANGE, calculator_predictions, parse_duration,
 )
@@ -1221,6 +1224,129 @@ def gear_tab(data: dict) -> None:
     }), hide_index=True, width="stretch")
 
 
+STICKER_PREVIEW_PX = 320
+# Preview backdrops that keep each ink readable (the PNG itself stays transparent).
+STICKER_BACKDROPS = {"White": "linear-gradient(160deg, #3a4a5c, #1d2731)",
+                     "Black": "linear-gradient(160deg, #f4efe6, #d9d2c5)",
+                     "Orange": "linear-gradient(160deg, #3a4a5c, #1d2731)"}
+
+
+def period_sticker_stats(activities: pd.DataFrame, fitness: pd.DataFrame,
+                         units: Units) -> dict[str, str]:
+    """Every stat a period sticker can show, formatted for display."""
+    kpis = summary_kpis(activities)
+    moving_s = activities["moving_time_s"].sum()
+    elevation = activities["elevation_gain_m"].sum()
+    return {
+        "Distance": units.format_distance(kpis["total_distance_km"], 0),
+        "Runs": f"{kpis['total_runs']:,}",
+        "Time": f"{kpis['total_hours']:,.0f} h",
+        "Avg pace": units.format_pace(moving_s / 60.0 / kpis["total_distance_km"]),
+        "Elevation gain": f"{elevation * units.per_metre:,.0f} {units.elevation_label}",
+        "Longest run": units.format_distance(activities["distance_km"].max()),
+        "Fitness": f"{fitness['ctl'].iloc[-1]:.0f}",
+    }
+
+
+def run_sticker_stats(run: pd.Series, units: Units) -> dict[str, str]:
+    """Every stat a run sticker can show, formatted for display; missing ones left out."""
+    stats = {
+        "Distance": units.format_distance(run["distance_km"], 2),
+        "Pace": units.format_pace(run["pace_min_per_km"]),
+        "Time": format_duration(run["moving_time_s"]),
+    }
+    if pd.notna(run["elevation_gain_m"]):
+        stats["Elev gain"] = f"{run['elevation_gain_m'] * units.per_metre:,.0f} " \
+                             f"{units.elevation_label}"
+    if pd.notna(run["avg_hr"]):
+        stats["Avg HR"] = f"{run['avg_hr']:.0f} bpm"
+    return stats
+
+
+def sticker_preview(png: bytes, ink: str) -> None:
+    """The sticker on a backdrop, with a button that copies the PNG to the clipboard."""
+    width, height = png_size(png)
+    shown = min(STICKER_PREVIEW_PX, width) * height / width
+    data_url = "data:image/png;base64," + base64.b64encode(png).decode()
+    components.html(f"""
+<div style="font-family: sans-serif;">
+  <div style="background: {STICKER_BACKDROPS[ink]}; border-radius: 12px; padding: 20px;
+              display: flex; justify-content: center;">
+    <img src="{data_url}" style="width: {STICKER_PREVIEW_PX}px; max-width: 100%;">
+  </div>
+  <button id="copy" style="margin-top: 12px; padding: 8px 16px; border-radius: 8px;
+          border: 1px solid #2a78d6; background: #2a78d6; color: white; font-size: 14px;
+          cursor: pointer;">Copy sticker</button>
+  <span id="status" style="margin-left: 10px; font-size: 13px; color: #555;"></span>
+</div>
+<script>
+  const status = document.getElementById("status");
+  document.getElementById("copy").addEventListener("click", async () => {{
+    try {{
+      // A promise, not a blob, keeps Safari's user-gesture requirement satisfied.
+      const blob = fetch("{data_url}").then(r => r.blob());
+      await navigator.clipboard.write([new ClipboardItem({{"image/png": blob}})]);
+      status.textContent = "Copied -- paste it into your story.";
+    }} catch (err) {{
+      status.textContent = "This browser blocked the copy; use Download instead.";
+    }}
+  }});
+</script>
+""", height=int(shown) + 100)
+
+
+def share_tab(data: dict, stream_data, path: Path) -> None:
+    activities, units = data["activities"], data["units"]
+    st.markdown("A transparent sticker of your stats, like Strava's, to paste onto an "
+                "Instagram story.")
+    kind = st.radio("Sticker for", ["This period", "One run"], horizontal=True,
+                    key="sticker_kind")
+    route = None
+    if kind == "One run":
+        runs = activities.sort_values("date", ascending=False)
+        labels = {int(row.activity_id): f"{row.date:%a %d %b %Y} -- {row.name} -- "
+                                        f"{units.format_distance(row.distance_km)}"
+                  for row in runs.itertuples()}
+        activity_id = st.selectbox("Run", list(labels), format_func=labels.get,
+                                   key="sticker_run")
+        run = runs.set_index("activity_id").loc[activity_id]
+        available = run_sticker_stats(run, units)
+        default = ["Distance", "Pace", "Time"]
+        caption = f"{run['name']} · {run['date']:%d %b %Y}"
+        if stream_data is not None:
+            route = streams.route_for(activity_id, data["all_activities"], path)
+    else:
+        available = period_sticker_stats(activities, data["fitness"], units)
+        default = ["Distance", "Runs", "Time"]
+        first, last = activities["date"].min(), activities["date"].max()
+        caption = (f"{first:%b %Y}" if f"{first:%b %Y}" == f"{last:%b %Y}"
+                   else f"{first:%b %Y} – {last:%b %Y}")
+
+    left, right = st.columns([1, 1])
+    with left:
+        chosen = st.multiselect("Stats", list(available), default=default, max_selections=4,
+                                key=f"sticker_stats_{kind}")
+        ink = st.radio("Colour", list(INKS), horizontal=True, key="sticker_ink")
+        caption = st.text_input("Caption", caption, key=f"sticker_caption_{kind}")
+        show_route = route is not None and not route.empty and st.toggle(
+            "Show route", value=True, key="sticker_route")
+        if not chosen:
+            st.info("Pick at least one stat.")
+            return
+        png = render_sticker([(name, available[name]) for name in chosen], caption,
+                             route if show_route else None, ink)
+        st.download_button("Download PNG", png, file_name="run-sticker.png", mime="image/png")
+        st.caption(
+            "**To post it:** copy the sticker, then on your iPhone open an Instagram story "
+            "and tap Paste (or the sticker Instagram offers from your clipboard). Copying on a "
+            "Mac reaches the phone through Universal Clipboard; otherwise download the PNG and "
+            "AirDrop it, then add it from Photos. The background is transparent, so your "
+            "photo shows through -- the backdrop here is only for the preview."
+        )
+    with right:
+        sticker_preview(png, ink)
+
+
 def main() -> None:
     path = choose_source()
     period_box = st.sidebar.container()  # filled once the runs are loaded
@@ -1257,9 +1383,9 @@ def main() -> None:
                    if all_streams is not None else None)
 
     (overview, fitness, performance, heart_rate, consistency, all_sports, run_detail, personal,
-     gear, recovery) = st.tabs(
+     gear, recovery, share) = st.tabs(
         ["Overview", "Fitness & Freshness", "Performance", "Heart rate", "Consistency",
-         "All sports", "Run detail", "Personal models", "Gear", "Sleep & HRV"]
+         "All sports", "Run detail", "Personal models", "Gear", "Sleep & HRV", "Share"]
     )
     with overview:
         overview_tab(data)
@@ -1281,6 +1407,8 @@ def main() -> None:
         gear_tab(data)
     with recovery:
         recovery_tab(data, is_sample=path == SAMPLE_CSV)
+    with share:
+        share_tab(data, stream_data, path)
 
 
 if __name__ == "__main__":
