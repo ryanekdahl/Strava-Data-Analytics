@@ -50,6 +50,10 @@ from src.personal_models import (
     MIN_PERFORMANCE_RUNS, TAU1_GRID, TAU2_GRID, fit_banister, fit_riegel, modelled_performance,
     performance_index, riegel_efforts,
 )
+from src.race_plan import (
+    MAX_SAFE_RAMP, RACE_READY_FORM, TAPER_SHAPES, plan_weeks, project_fitness,
+    race_day_advice, race_day_summary, recent_weekly_load, template_plan,
+)
 from src.recovery import (
     RECOVERY_CSV, RECOVERY_METRICS, TEMPLATE_CSV, TRAINING_METRICS, correlation_table,
     join_recovery, load_recovery, rolling_baseline, synthetic_recovery,
@@ -455,6 +459,113 @@ def fitness_tab(data: dict) -> None:
                 "the runs' each day -- the All sports tab shows how."
             )
     relative_effort_section(data)
+
+
+def form_word(tsb: float) -> str:
+    """The first words of :func:`form_label` -- "Fresh", "Very fatigued" -- for a metric card."""
+    return form_label(tsb).split(" -- ")[0].split(" (")[0]
+
+
+def race_plan_tab(data: dict) -> None:
+    """Project Fitness, Fatigue and Form from the whole history to a race date."""
+    daily, ctl_days, atl_days = data["daily"], data["ctl_days"], data["atl_days"]
+    last = daily.index.max()
+    plan_start = last + pd.Timedelta(days=1)
+    recent = recent_weekly_load(daily)
+    st.markdown(
+        f"Pick a race and plan your weekly training load up to it; the chart runs the "
+        f"Fitness & Freshness model forward to show the Form you would start with. The plan "
+        f"begins the day after your last recorded session ({last:%d %b %Y}).")
+
+    cols = st.columns(4)
+    race = pd.Timestamp(cols[0].date_input(
+        "Race date", value=(last + pd.Timedelta(weeks=12)).date(),
+        min_value=(plan_start + pd.Timedelta(days=1)).date(),
+        max_value=(last + pd.Timedelta(weeks=52)).date(), key="race_date"))
+    weekly = cols[1].number_input(
+        "Starting weekly load", 0, 3000, int(round(recent / 10) * 10), step=10, key="plan_load",
+        help=f"Your last four weeks averaged {recent:.0f} points a week. One hour at threshold "
+             "pace scores 100; an easy hour about 50-60.")
+    increase = cols[2].slider("Weekly increase", 0, 15, 5, format="%d%%", key="plan_increase",
+                              help="How much each build week adds to the one before.")
+    taper = cols[3].selectbox(
+        "Taper", list(TAPER_SHAPES), index=2, key="plan_taper",
+        format_func=lambda n: "None" if n == 0 else f"{n} week{'s' if n > 1 else ''}",
+        help="The final weeks keep "
+             + "; ".join(f"{n}: {', '.join(f'{s:.0%}' for s in shape)}"
+                         for n, shape in TAPER_SHAPES.items() if n)
+             + " of the peak build week.")
+
+    template = template_plan(plan_weeks(plan_start, race), weekly, increase / 100, taper)
+    chart_box, summary_box = st.container(), st.container()
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("**Week by week** -- edit any week's load to override the template.")
+        edited = st.data_editor(
+            template.assign(week_start=template["week_start"].dt.date),
+            column_order=["weeks_out", "week_start", "days", "load"],
+            column_config={
+                "weeks_out": st.column_config.NumberColumn("Weeks to race", disabled=True),
+                "week_start": st.column_config.DateColumn("From", disabled=True,
+                                                          format="ddd D MMM"),
+                "days": st.column_config.NumberColumn("Days", disabled=True),
+                "load": st.column_config.NumberColumn("Planned load", min_value=0, step=10,
+                                                      format="%d"),
+            },
+            hide_index=True, width="stretch",
+            # A new template replaces any hand edits made to the old one.
+            key=f"plan_editor_{race:%Y%m%d}_{weekly}_{increase}_{taper}",
+        )
+    plan = template.assign(load=pd.to_numeric(edited["load"], errors="coerce")
+                           .fillna(0.0).to_numpy())
+    projection = project_fitness(daily, plan, race, ctl_days, atl_days)
+    summary = race_day_summary(projection)
+
+    chart_box.plotly_chart(plots.race_plan_figure(projection, RACE_READY_FORM, ctl_days,
+                                                  atl_days), width="stretch")
+    chart_box.caption(
+        "Solid lines are your recorded history, dotted lines the plan. The green band is "
+        f"Form of {RACE_READY_FORM[0]:+.0f} to {RACE_READY_FORM[1]:+.0f}: rested enough to race "
+        "well without having lost much Fitness to rest."
+        + ("" if (ctl_days, atl_days) == (CTL_DAYS, ATL_DAYS) else
+           f" The projection uses your fitted {ctl_days}- and {atl_days}-day time constants."))
+    cards = summary_box.columns(4)
+    cards[0].metric("Race-day Fitness", f"{summary['ctl']:.0f}",
+                    delta=f"{summary['ctl_change']:+.1f} vs now")
+    cards[1].metric("Race-day Form", f"{summary['tsb']:+.0f}",
+                    delta=form_word(summary["tsb"]),
+                    delta_color="off")
+    cards[2].metric("Lowest Form on the way", f"{summary['min_tsb']:+.0f}",
+                    delta=form_word(summary["min_tsb"]),
+                    delta_color="off")
+    cards[3].metric("Steepest week", f"{summary['max_ramp']:+.1f}",
+                    delta="Fitness points in 7 days", delta_color="off")
+    in_band = RACE_READY_FORM[0] <= summary["tsb"] <= RACE_READY_FORM[1]
+    (summary_box.success if in_band else summary_box.warning)(race_day_advice(summary))
+    if summary["max_ramp"] > MAX_SAFE_RAMP:
+        summary_box.warning(
+            f"Fitness climbs {summary['max_ramp']:.1f} points in one week of this plan. Rises "
+            f"above about {MAX_SAFE_RAMP:.0f} a week are a common rule of thumb for a build that "
+            "is hard to absorb -- consider a smaller weekly increase.")
+
+    with right:
+        st.markdown(
+            f"""
+            **How the projection works.** Each week's planned load is spread evenly over its
+            days and appended to your recorded daily load, and the same {ctl_days}-day and
+            {atl_days}-day averages behind the Fitness & Freshness chart are run forward, so
+            the plan starts from the Fitness and Fatigue you actually have today.
+
+            The template starts at your chosen weekly load, adds the weekly increase through
+            the build, then tapers -- cutting volume by roughly 40-50% over the last
+            fortnight, the range tapering research finds works best. Keep some faster running
+            in the taper: it is volume, not intensity, that comes down.
+
+            Race-day Form is the balance at the end of the day before the race. Where in a
+            week the hard sessions fall moves Form by a few points on any given day, which an
+            even spread does not show.
+            """
+        )
 
 
 def relative_effort_section(data: dict) -> None:
@@ -1382,15 +1493,17 @@ def main() -> None:
     stream_data = (streams.restrict(all_streams, activities["activity_id"])
                    if all_streams is not None else None)
 
-    (overview, fitness, performance, heart_rate, consistency, all_sports, run_detail, personal,
-     gear, recovery, share) = st.tabs(
-        ["Overview", "Fitness & Freshness", "Performance", "Heart rate", "Consistency",
+    (overview, fitness, race_plan, performance, heart_rate, consistency, all_sports, run_detail,
+     personal, gear, recovery, share) = st.tabs(
+        ["Overview", "Fitness & Freshness", "Race plan", "Performance", "Heart rate", "Consistency",
          "All sports", "Run detail", "Personal models", "Gear", "Sleep & HRV", "Share"]
     )
     with overview:
         overview_tab(data)
     with fitness:
         fitness_tab(data)
+    with race_plan:
+        race_plan_tab(data)
     with performance:
         performance_tab(data, stream_data, riegel)
     with heart_rate:

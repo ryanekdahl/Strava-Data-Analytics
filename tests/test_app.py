@@ -89,3 +89,19 @@ def test_share_tab_makes_period_and_run_stickers(app):
     app.radio(key="sticker_ink").set_value("Black").run()
     _assert_clean(app)
     app.radio(key="sticker_kind").set_value("This period").run()
+
+
+def test_race_plan_tab_projects_to_race_day(app):
+    assert any(tab.label == "Race plan" for tab in app.tabs)
+    assert any(m.label == "Race-day Form" for m in app.metric)
+    app.selectbox(key="plan_taper").set_value(0).run()
+    _assert_clean(app)
+    untapered = float(next(m for m in app.metric if m.label == "Race-day Form").value)
+    app.selectbox(key="plan_taper").set_value(3).run()
+    _assert_clean(app)
+    tapered = float(next(m for m in app.metric if m.label == "Race-day Form").value)
+    assert tapered > untapered
+    app.radio(key="time_constants").set_value("Fitted to my data").run()
+    _assert_clean(app)
+    app.radio(key="time_constants").set_value(app.radio(key="time_constants").options[0]).run()
+    app.selectbox(key="plan_taper").set_value(2).run()

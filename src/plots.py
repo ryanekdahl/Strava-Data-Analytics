@@ -378,6 +378,47 @@ def recovery_scatter_figure(
     return _base(fig, height=400, y_title=y_title, x_title=x_title)
 
 
+def race_plan_figure(projection: pd.DataFrame, race_ready: tuple[float, float],
+                     ctl_days: int = 42, atl_days: int = 7, history_days: int = 90) -> go.Figure:
+    """The last ``history_days`` of Fitness, Fatigue and Form, then the plan dotted to race day."""
+    fitness_name, fatigue_name = fitness_freshness_title(ctl_days, atl_days)
+    history = projection[~projection["projected"]].tail(history_days)
+    # The projected lines start on the last recorded day so the two halves join.
+    future = pd.concat([history.tail(1), projection[projection["projected"]]])
+    fig = go.Figure()
+    fig.add_hrect(y0=race_ready[0], y1=race_ready[1], fillcolor=GOOD, opacity=0.08,
+                  line_width=0)
+    for column, name, color in (("ctl", fitness_name, SERIES["fitness"]),
+                                ("atl", fatigue_name, SERIES["fatigue"]),
+                                ("tsb", "Form (Fitness - Fatigue)", SERIES["form"])):
+        label = name.split(" (")[0]
+        fig.add_trace(go.Scatter(
+            x=history["date"], y=history[column], name=name, mode="lines", legendgroup=column,
+            line=dict(color=color, width=2),
+            hovertemplate=f"{label} %{{y:.1f}}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=future["date"], y=future[column], name=f"{label} (planned)", mode="lines",
+            legendgroup=column, showlegend=False, line=dict(color=color, width=2, dash="dot"),
+            hovertemplate=f"{label} %{{y:.1f}} planned<extra></extra>",
+        ))
+    fig.add_hline(y=0, line_color=AXIS, line_width=1)
+
+    race = projection.iloc[-1]
+    fig.add_vline(x=race["date"], line_color=INK_SECONDARY, line_width=1, line_dash="dash")
+    fig.add_annotation(x=race["date"], y=1, yref="paper", text="<b>Race day</b>",
+                       showarrow=False, xanchor="right", yanchor="top",
+                       font=dict(color=INK_SECONDARY, size=12), bgcolor=SURFACE)
+    shown = pd.concat([history, future])[["ctl", "atl", "tsb"]].to_numpy()
+    _gutter_labels(fig, [
+        (float(race["ctl"]), f"Fitness {race['ctl']:.0f}", SERIES["fitness"]),
+        (float(race["atl"]), f"Fatigue {race['atl']:.0f}", SERIES["fatigue"]),
+        (float(race["tsb"]), f"Form {race['tsb']:+.0f}", SERIES["form"]),
+    ], float(shown.max() - shown.min()))
+    fig.update_layout(title="Projected Fitness &amp; Freshness to race day")
+    return _base(fig, height=420, y_title="Load points", right=96)
+
+
 def fitness_freshness_title(ctl_days: int, atl_days: int) -> tuple[str, str]:
     """Legend names for the Fitness and Fatigue lines at the given time constants."""
     return f"Fitness ({ctl_days}-day)", f"Fatigue ({atl_days}-day)"
