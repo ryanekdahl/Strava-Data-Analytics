@@ -23,8 +23,8 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has eleven tabs — Overview, Fitness & Freshness,
-Performance, Heart rate, Consistency, All sports, Run detail, Personal models, Gear,
+Python 3.11+. The dashboard has twelve tabs — Overview, Fitness & Freshness,
+Race plan, Performance, Heart rate, Consistency, All sports, Run detail, Personal models, Gear,
 Sleep & HRV and Share — and a sidebar with a switch between the bundled sample data and
 your own export, a
 **period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
@@ -38,6 +38,7 @@ choice between the standard and your fitted Fitness time constants.
 |---|---|
 | **Overview** | Total distance, runs, hours and weeks tracked (with the change from the previous period of the same length when a period is picked); current Fitness, Form and ACWR with a plain-English reading of each |
 | **Fitness & Freshness** | CTL / ATL / TSB over time (standard or fitted time constants), the exact load formula behind the curve, and a check of the load score against Strava's own Relative Effort |
+| **Race plan** | Pick a race date and plan your weekly training load — a build-and-taper template you can edit week by week — and see Fitness, Fatigue and Form projected to race day, with a check that race-day Form lands in the race-ready band and that no week ramps Fitness too fast |
 | **Performance** | Pace-vs-distance scatter with the best-effort frontier; true in-run best efforts and a pace curve from the GPS files; the PR table; Riegel race predictions with the standard or your fitted exponent; an interactive race-time calculator; recent form vs all-time best; and 30-day rolling pace and heart-rate trends |
 | **Heart rate** | Share of time in zones Z1–Z5 — second by second when the GPS files are present, compared against the average-HR shortcut — monthly hours by zone, and each zone's bpm range |
 | **Consistency** | Weekly distance, hours and run counts, monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
@@ -121,6 +122,28 @@ is the balance you finished yesterday with.
 Reading the chart: Form above roughly +5 means rested and race-ready, around zero
 means steady training, and deeply negative means a productive overload block that
 needs to end soon.
+
+### Race plan — `src/race_plan.py`
+
+The planner runs the same Fitness/Fatigue equations *forward*. The days from the
+day after your last recorded session to the day before the race are cut into 7-day
+blocks counted back from race day (so only the first block can be short), and each
+block carries one planned load. The template fills them from three inputs — a
+starting weekly load (by default your last four weeks' average), a weekly increase,
+and a taper of one to three weeks that keeps 60%; 75% then 55%; or 85%, 70% then
+55% of the peak build week. A two-week taper therefore cuts volume by roughly
+40–50%, the range a meta-analysis of tapering studies found most effective
+(Bosquet et al., 2007). Any week can then be overridden by hand.
+
+Each block's load is spread evenly over its days, appended to the recorded daily
+load, and the combined series goes through the same `compute_fitness_freshness`,
+so the projection continues the exact curve on the Fitness tab (with the fitted
+time constants, if those are selected). Race-day Form is read on the race date,
+i.e. the balance finished the night before. The planner flags Form outside **+5 to
++15** on race day — the "fresh" band of the Form reading — and any week in which
+Fitness rises by more than 8 points, a common rule of thumb for a build that is
+too steep to absorb. The even spread is a stated simplification: where the hard
+sessions fall in a week shifts Form by a few points on a given day.
 
 ### What the export carries beyond the basics — `src/loader.py`
 
@@ -407,6 +430,10 @@ exercised by the sample rather than bypassed.
 - **Riegel assumes a constant fatigue exponent.** 1.06 is a population fit. It is
   pessimistic for well-trained marathoners and optimistic for beginners, and it
   cannot know whether you have done the long runs a marathon requires.
+- **The race plan projects load, not performance.** It says what Form you would
+  carry into the race if you did exactly the planned load; it cannot say how fast
+  you will run, and a plan written in load points still has to be turned into
+  actual sessions.
 - **ACWR is contested.** The 0.8–1.3 band is widely cited and widely criticised;
   treat it as a conversation starter about your own trend, not a risk score.
 - **Weather is ignored, and elevation only partly handled.** Where the export has
