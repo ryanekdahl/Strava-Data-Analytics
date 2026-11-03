@@ -430,6 +430,78 @@ def generate_sample(
 
 
 # --------------------------------------------------------------------------
+# Friends, for the Head to head tab
+# --------------------------------------------------------------------------
+
+# name: (seed, pace factor, volume factor, share of your long runs they join).
+# Alex is quicker on less volume; Sam is slower but runs further.
+SAMPLE_FRIENDS = {"Alex": (7, 0.93, 0.80, 0.35), "Sam": (11, 1.07, 1.20, 0.20)}
+_GROUP_RUN_MIN_M = 14_000.0
+_DATE_FORMAT = "%b %d, %Y, %-I:%M:%S %p"
+_SCALED_BY_VOLUME = ("Distance", "Grade Adjusted Distance", "Elevation Gain")
+_SCALED_BY_TIME = ("Moving Time", "Elapsed Time")
+
+
+def friends_are_current(you_csv: str | Path = SAMPLE_CSV) -> bool:
+    """Whether every sample friend's export exists and is newer than the sample itself."""
+    you_csv = Path(you_csv)
+    paths = [you_csv.parent / "friends" / f"{name.lower()}.csv" for name in SAMPLE_FRIENDS]
+    return you_csv.is_file() and all(
+        path.is_file() and path.stat().st_mtime >= you_csv.stat().st_mtime for path in paths)
+
+
+def generate_friends(you_csv: str | Path = SAMPLE_CSV,
+                     out_dir: str | Path | None = None) -> dict[str, Path]:
+    """Write a synthetic export for each of :data:`SAMPLE_FRIENDS` and return their paths.
+
+    Each friend is the sample runner re-simulated with their own seed, then
+    made faster or slower (``pace factor`` scales every run's time) and bigger
+    or smaller in volume.  They also join a share of your long runs -- same
+    start within a few minutes, much the same distance, at a pace pulled
+    toward yours -- so the tab's "runs together" view has something to find.
+    No GPS recordings are written for friends.
+    """
+    you_csv = Path(you_csv)
+    out_dir = Path(out_dir) if out_dir is not None else you_csv.parent / "friends"
+    you = pd.read_csv(you_csv)
+    you["Activity Date"] = pd.to_datetime(you["Activity Date"], format="mixed")
+    long_runs = you[(you["Activity Type"] == "Run") & (you["Distance"] >= _GROUP_RUN_MIN_M)]
+    paths = {}
+    for name, (seed, pace, volume, join) in SAMPLE_FRIENDS.items():
+        path = out_dir / f"{name.lower()}.csv"
+        frame = generate_sample(path, seed=seed, end_date=you["Activity Date"].max().date(),
+                                write_streams=False)
+        frame["Activity Date"] = pd.to_datetime(frame["Activity Date"], format="mixed")
+        frame["Activity ID"] += seed * 10_000_000
+        runs = frame["Activity Type"] == "Run"
+        for column in _SCALED_BY_VOLUME + _SCALED_BY_TIME:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("float64")
+        frame.loc[runs, list(_SCALED_BY_VOLUME)] *= volume
+        frame.loc[runs, list(_SCALED_BY_TIME)] *= volume * pace
+        frame[list(_SCALED_BY_TIME)] = frame[list(_SCALED_BY_TIME)].round()
+        frame["Filename"] = ""
+
+        rng = np.random.default_rng([seed, 1])
+        joined = long_runs[rng.random(len(long_runs)) < join].copy()
+        stretch = rng.uniform(0.97, 1.03, len(joined))
+        together = 1.0 + 0.3 * (pace - 1.0) + rng.normal(0.0, 0.01, len(joined))
+        joined["Activity ID"] = frame["Activity ID"].max() + 1 + np.arange(len(joined))
+        joined["Activity Date"] += pd.to_timedelta(rng.integers(-4, 5, len(joined)), unit="min")
+        joined["Activity Name"] = "Group Long Run"
+        for column in _SCALED_BY_VOLUME:
+            joined[column] = pd.to_numeric(joined[column], errors="coerce") * stretch
+        for column in _SCALED_BY_TIME:
+            joined[column] = (joined[column] * stretch * together).round()
+        joined[["Activity Gear", "Filename"]] = ""
+
+        frame = pd.concat([frame, joined[CSV_COLUMNS]]).sort_values("Activity Date")
+        frame["Activity Date"] = frame["Activity Date"].dt.strftime(_DATE_FORMAT)
+        frame.to_csv(path, index=False)
+        paths[name] = path
+    return paths
+
+
+# --------------------------------------------------------------------------
 # GPS recordings
 # --------------------------------------------------------------------------
 
@@ -592,6 +664,9 @@ def main() -> None:
     print(f"Wrote {len(frame)} activities ({len(runs)} runs, "
           f"{len(frame) - len(runs)} other sports) to {args.out}")
     print(f"Date range: {frame['Activity Date'].iloc[0]} -> {frame['Activity Date'].iloc[-1]}")
+    if Path(args.out).resolve() == SAMPLE_CSV.resolve():
+        friends = generate_friends(args.out)
+        print(f"Wrote {len(friends)} sample friends ({', '.join(friends)}) for Head to head")
 
 
 if __name__ == "__main__":

@@ -18,14 +18,14 @@ and interactive the moment you start it, with no account and no API keys.
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python -m src.generate_sample        # writes data/sample/activities.csv + GPS files
+python -m src.generate_sample        # writes data/sample/activities.csv + GPS files + 2 friends
 pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has twelve tabs — Overview, Fitness & Freshness,
+Python 3.11+. The dashboard has thirteen tabs — Overview, Fitness & Freshness,
 Race plan, Performance, Heart rate, Consistency, All sports, Run detail, Personal models, Gear,
-Sleep & HRV and Share — and a sidebar with a switch between the bundled sample data and
+Sleep & HRV, Head to head and Share — and a sidebar with a switch between the bundled sample data and
 your own export, a
 **period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
 custom range), **kilometres or miles**, your resting and max heart rate, whether rides, swims and
@@ -47,6 +47,7 @@ choice between the standard and your fitted Fitness time constants.
 | **Personal models** | Your own Riegel exponent with a 95% interval, and Banister fitness–fatigue time constants fitted to your runs, with a bootstrap interval, the fit surface, and what one hard session does day by day |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 | **Sleep & HRV** | Import a sleep-score / HRV CSV (Whoop, Oura, Garmin or the template) and see how each morning's reading correlates with the previous day's load, Fatigue and Form — see `src/recovery.py` |
+| **Head to head** | Add friends' Strava exports and compare over the same period: a scoreboard of ten categories (distance, runs, time, elevation, longest run, distance per week, consistency, streak, pace, Fitness), a cumulative-distance race, weekly distance battles, Fitness side by side, best efforts and race predictions, and the runs you did together with who was faster — see `src/head_to_head.py` |
 | **Share** | A Strava-style sticker for an Instagram story: the period's or one run's headline stats (and the route) on a transparent PNG, copied to the clipboard or downloaded — see `src/sticker.py` |
 
 ## Methodology
@@ -471,6 +472,22 @@ exercised by the sample rather than bypassed.
 │   └── plots.py                # plotly figure builders
 └── tests/                      # pytest: loader contract, load model, predictions, workload
 ```
+
+### Head to head — `src/head_to_head.py`
+
+Each friend is one more `activities.csv`, uploaded on the tab (or dropped into
+`data/raw/friends/` as `<name>.csv` or `<name>/activities.csv`). It goes through the
+same loader and load model as yours. Everyone is measured over the sidebar's period,
+so a longer export does not win on history alone, and per-week rates sit beside the
+totals. Fitness is computed on each whole history and then cut, with the standard
+42/7-day constants for everyone and the default 60/190 bpm heart rates for friends,
+whose own are unknown. Because load is scored against each runner's *own* threshold
+pace, Fitness compares how hard each of you trains relative to your ability, not who
+is faster; the best-effort (whole-run, as friends' GPS files are not read) and Riegel
+prediction tables answer that. Two runs count as *together* when they start within
+15 minutes and their distances differ by at most 15%. The sample data ships two
+synthetic friends — Alex, quicker on less volume, and Sam, slower on more — who join
+some of the sample runner's long runs.
 
 ### The synthetic data
 

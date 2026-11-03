@@ -105,3 +105,19 @@ def test_race_plan_tab_projects_to_race_day(app):
     _assert_clean(app)
     app.radio(key="time_constants").set_value(app.radio(key="time_constants").options[0]).run()
     app.selectbox(key="plan_taper").set_value(2).run()
+
+
+def test_head_to_head_tab_compares_sample_friends(app):
+    assert any(tab.label == "Head to head" for tab in app.tabs)
+    assert any(m.label == "Runs together" for m in app.metric)
+    app.multiselect(key="h2h_friends").set_value(["Sam"]).run()
+    _assert_clean(app)
+    assert {"You", "Sam"} <= {m.label for m in app.metric}
+    app.text_input(key="h2h_me").set_value("Ryan").run()
+    app.selectbox(key="period").set_value("Last 4 weeks").run()
+    _assert_clean(app)
+    app.selectbox(key="period").set_value("All time").run()
+    app.text_input(key="h2h_me").set_value("You").run()
+    app.multiselect(key="h2h_friends").set_value(["Alex", "Sam"]).run()
+    app.selectbox(key="h2h_shared_friend").set_value("Sam").run()
+    _assert_clean(app)

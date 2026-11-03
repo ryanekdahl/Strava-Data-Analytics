@@ -814,3 +814,69 @@ def sport_load_figure(summary: pd.DataFrame) -> go.Figure:
     fig.update_xaxes(range=[0, max(float(ordered["load_share"].max()) * 118.0, 10.0)])
     fig.update_yaxes(gridcolor="rgba(0,0,0,0)", tickfont=dict(color=INK_SECONDARY))
     return fig
+
+
+# One colour per athlete, you first; a fixed order so a friend keeps their colour.
+ATHLETE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#6250d6")
+
+
+def athlete_color(index: int) -> str:
+    return ATHLETE_COLORS[index % len(ATHLETE_COLORS)]
+
+
+def athlete_lines_figure(frame: pd.DataFrame, names: list[str], y: str, title: str,
+                         y_title: str, hover_fmt: str, scale: float = 1.0) -> go.Figure:
+    """One line per athlete from a long ``DataFrame[date, athlete, <y>]``, labelled at the end."""
+    fig = go.Figure()
+    entries = []
+    for index, name in enumerate(names):
+        rows = frame[frame["athlete"] == name]
+        values = rows[y] * scale
+        color = athlete_color(index)
+        fig.add_trace(go.Scatter(
+            x=rows["date"], y=values, name=name, mode="lines", line=dict(color=color, width=2),
+            hovertemplate=f"{name}: %{{y:{hover_fmt}}}<extra></extra>",
+        ))
+        if not rows.empty:
+            entries.append((float(values.iloc[-1]), f"{name} {values.iloc[-1]:{hover_fmt}}",
+                            color))
+    span = float((frame[y] * scale).max() - (frame[y] * scale).min()) if not frame.empty else 0.0
+    _gutter_labels(fig, entries, span)
+    fig.update_layout(title=title)
+    return _base(fig, height=380, y_title=y_title, right=120)
+
+
+def weekly_battle_figure(battles: pd.DataFrame, names: list[str],
+                         units: Units = METRIC) -> go.Figure:
+    """Distance per week for each athlete, bars side by side."""
+    label = units.distance_label
+    fig = go.Figure()
+    for index, name in enumerate(names):
+        fig.add_trace(go.Bar(
+            x=battles["week_start"], y=units.distance(battles[name]), name=name,
+            marker=dict(color=athlete_color(index), cornerradius=3),
+            hovertemplate=f"{name}: %{{y:.1f}} {label}<extra></extra>",
+        ))
+    fig.update_layout(title="Weekly distance, head to head", barmode="group", bargap=0.2,
+                      bargroupgap=0.05)
+    fig.update_xaxes(hoverformat="Week of %d %b %Y")
+    return _base(fig, height=360, y_title=f"Distance ({label})")
+
+
+def shared_runs_figure(shared: pd.DataFrame, you: str, friend: str,
+                       units: Units = METRIC) -> go.Figure:
+    """Seconds per km (or mile) by which you were faster (up) or slower (down) on each run."""
+    gap = units.pace(shared["pace_gap_s"])
+    fig = go.Figure(go.Bar(
+        x=shared["date"], y=gap,
+        marker=dict(color=[athlete_color(0) if g >= 0 else athlete_color(1) for g in gap],
+                    cornerradius=3),
+        customdata=shared["name"],
+        hovertemplate=("%{x|%d %b %Y} · %{customdata}<br>%{y:+.0f} s/"
+                       f"{units.distance_label}<extra></extra>"),
+    ))
+    fig.add_hline(y=0, line_color=AXIS, line_width=1)
+    fig.update_layout(title=f"Pace gap on runs together (up = {you} faster, down = "
+                            f"{friend} faster)", showlegend=False, hovermode="closest",
+                      bargap=0.3)
+    return _base(fig, height=320, y_title=f"Seconds per {units.distance_label}")

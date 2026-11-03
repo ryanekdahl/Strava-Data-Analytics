@@ -35,7 +35,15 @@ from src.consistency import (
     weekly_streaks, weekly_volume,
 )
 from src.gear import DEFAULT_RETIRE_KM, INACTIVE_DAYS, gear_summary, unassigned_share
-from src.generate_sample import generate_sample, sample_is_current
+from src.generate_sample import (
+    friends_are_current, generate_friends, generate_sample, sample_is_current,
+)
+from src.head_to_head import (
+    FRIENDS_DIR, SAMPLE_FRIENDS_DIR, SHARED_DISTANCE_TOLERANCE, SHARED_WINDOW_MIN, TIE,
+    athlete_profile, cumulative_distance, cut_period, find_friend_exports, fitness_comparison,
+    head_to_head_table, prediction_comparison, record_comparison, save_friend_export,
+    scoreboard, shared_runs, weekly_battles,
+)
 from src.heart_rate import (
     hr_coverage, monthly_zone_hours, run_zone_breakdown, stream_monthly_zone_hours,
     stream_run_zone_breakdown, stream_zone_distribution, zone_distribution,
@@ -162,6 +170,21 @@ def other_sports_info(path: str, _mtime: float) -> tuple[int, bool]:
     return len(other), bool(other[["avg_watts", "weighted_watts"]].notna().any().any())
 
 
+@st.cache_data(show_spinner="Crunching a friend's activities...")
+def build_friend(path: str, _mtime: float, include_other: bool = True) -> dict:
+    """A friend's runs and Fitness, scored like yours but with the default heart rates.
+
+    Only what Head to head needs is computed -- no GPS files, no personal fits.
+    """
+    activities = load_activities(path)
+    scored = compute_activity_load(activities)
+    other = compute_other_load(load_other_activities(path))
+    counted = (pd.concat([scored[["date", "load"]], other[["date", "load"]]])
+               if include_other and not other.empty else scored)
+    return {"activities": activities,
+            "fitness": compute_fitness_freshness(daily_load_series(counted))}
+
+
 @st.cache_data(show_spinner=False)
 def read_recovery(content: bytes) -> pd.DataFrame:
     """Parse a sleep/HRV CSV once per distinct file contents."""
@@ -174,6 +197,9 @@ def choose_source() -> Path:
     if not sample_is_current() or not (SAMPLE_CSV.parent / "activities").is_dir():
         with st.spinner("Generating sample data..."):
             generate_sample(SAMPLE_CSV)
+    if not friends_are_current(SAMPLE_CSV):
+        with st.spinner("Generating sample friends..."):
+            generate_friends(SAMPLE_CSV)
 
     sources = {"Sample data (synthetic)": SAMPLE_CSV}
     real_export = find_real_export()
@@ -1458,6 +1484,203 @@ def share_tab(data: dict, stream_data, path: Path) -> None:
         sticker_preview(png, ink)
 
 
+MAX_FRIENDS = 5
+
+
+def format_metric(key: str, value: float, units: Units) -> str:
+    """One :data:`src.head_to_head.METRICS` value, formatted for the table."""
+    if pd.isna(value):
+        return "--"
+    if key in ("distance_km", "weekly_km", "longest_km"):
+        return units.format_distance(value, 0 if key == "distance_km" else 1)
+    if key == "elevation_m":
+        return f"{value * units.per_metre:,.0f} {units.elevation_label}"
+    if key == "hours":
+        return f"{value:,.1f} h"
+    if key == "active_share":
+        return f"{value:.0%}"
+    if key == "longest_streak":
+        return f"{value:.0f} weeks"
+    if key == "avg_pace":
+        return units.format_pace(value)
+    return f"{value:,.0f}"
+
+
+def add_friend_form() -> None:
+    """Upload a friend's ``activities.csv``, check it reads, and save it to ``data/raw/friends/``."""
+    with st.expander("Add a friend"):
+        st.markdown(
+            "Ask a friend to request their archive from Strava (Settings -> My Account -> "
+            "Download or Delete Your Account) and send you its `activities.csv`. It is saved "
+            "as `data/raw/friends/<name>.csv` and stays on this computer; you can also drop "
+            "files there yourself.")
+        name = st.text_input("Friend's name", key="friend_name")
+        uploaded = st.file_uploader("Their activities.csv", type="csv", key="friend_upload")
+        if not st.button("Add friend", disabled=not (name.strip() and uploaded)):
+            return
+        try:
+            path = save_friend_export(uploaded.getvalue(), name.strip())
+        except ValueError as err:
+            st.error(str(err))
+            return
+        try:
+            runs = load_activities(path)
+        except (ValueError, pd.errors.ParserError, UnicodeDecodeError) as err:
+            path.unlink()
+            st.error(f"That file could not be read as a Strava export: {err}")
+            return
+        if runs.empty:
+            path.unlink()
+            st.error("That export has no runs in it.")
+            return
+        st.rerun()
+
+
+def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timestamp) -> None:
+    units = data["units"]
+    is_sample = path == SAMPLE_CSV
+    st.markdown(
+        "Put your running next to your friends': everyone measured over the period picked "
+        "in the sidebar, from each person's own Strava export.")
+    if is_sample:
+        st.caption("These friends are synthetic, generated alongside the sample data. With "
+                   "your own export selected you can add real friends here.")
+    else:
+        add_friend_form()
+
+    exports = find_friend_exports(SAMPLE_FRIENDS_DIR if is_sample else FRIENDS_DIR)
+    if not exports:
+        st.info("No friends added yet. Add a friend's `activities.csv` above to compare.")
+        return
+    cols = st.columns([1, 3])
+    me = cols[0].text_input("Your name", "You", key="h2h_me").strip() or "You"
+    chosen = cols[1].multiselect("Compare with", list(exports),
+                                 default=list(exports)[:MAX_FRIENDS],
+                                 max_selections=MAX_FRIENDS, key="h2h_friends")
+    if not chosen:
+        st.info("Pick at least one friend to compare with.")
+        return
+    if me in chosen:
+        st.warning(f"A friend is also called {me}; pick a different name for yourself.")
+        return
+
+    # Yours with the standard constants, as your friends' are, so Fitness compares fairly.
+    athletes = {me: {"activities": data["all_activities"],
+                     "fitness": compute_fitness_freshness(data["daily"])}}
+    for name in chosen:
+        friend_path = exports[name]
+        athletes[name] = build_friend(str(friend_path), friend_path.stat().st_mtime,
+                                      data["include_other"])
+    names = list(athletes)
+    runs = {name: cut_period(a["activities"], start, end) for name, a in athletes.items()}
+    idle = [name for name in chosen if runs[name].empty]
+    if idle:
+        st.warning(f"{', '.join(idle)} recorded no runs in this period, so they score zero "
+                   "on everything below. Try a longer period in the sidebar.")
+
+    profiles = {name: athlete_profile(a["activities"], a["fitness"], start, end)
+                for name, a in athletes.items()}
+    table = head_to_head_table(profiles)
+    wins = scoreboard(table, names)
+    st.subheader("Scoreboard")
+    cards = st.columns(len(names))
+    for card, name in zip(cards, names):
+        card.metric(name, f"{wins[name]} of {len(table)}", delta="categories led",
+                    delta_color="off")
+    display = pd.DataFrame({"Metric": table["label"]})
+    for name in names:
+        display[name] = [format_metric(key, value, units)
+                         for key, value in zip(table["metric"], table[name])]
+    display["Leader"] = table["leader"].fillna("--")
+    st.dataframe(display, hide_index=True, width="stretch")
+    st.caption(
+        f"Over {start:%d %b %Y} -- {end - pd.Timedelta(days=1):%d %b %Y} for everyone. "
+        "\"Weeks with a run\" and the streak count calendar weeks in the period. A tie leads "
+        "for no one. Fitness is scored against each runner's *own* threshold pace, so it "
+        "compares how hard each of you is training for yourselves, not who is faster -- the "
+        "tables below answer that.")
+
+    st.plotly_chart(plots.athlete_lines_figure(
+        cumulative_distance(runs, start, end), names, "distance_km",
+        "Distance race through the period", f"Distance ({units.distance_label})", ",.0f",
+        scale=units.per_km), width="stretch")
+    st.caption("Running total of distance from the start of the period. A steeper line is a "
+               "bigger block of training.")
+
+    battles = weekly_battles(runs, start, end)
+    week_wins = battles["leader"].value_counts()
+    st.plotly_chart(plots.weekly_battle_figure(battles, names, units), width="stretch")
+    st.caption("Weeks won (furthest distance): " + ", ".join(
+        f"**{name}** {int(week_wins.get(name, 0))}" for name in names)
+        + (f", tied {int(week_wins[TIE])}" if TIE in week_wins else "")
+        + f" of {len(battles)} weeks.")
+
+    st.plotly_chart(plots.athlete_lines_figure(
+        fitness_comparison({name: a["fitness"] for name, a in athletes.items()}, start, end),
+        names, "ctl", "Fitness (CTL), head to head", "Load points", ".0f"), width="stretch")
+    st.caption(
+        f"Everyone's Fitness uses the standard {CTL_DAYS}-day constant, and friends' heart-rate "
+        f"scores use the default resting {DEFAULT_HR_REST:.0f} / max {DEFAULT_HR_MAX:.0f} bpm, "
+        "since their own are not known. Other sports count as set in the sidebar.")
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Best efforts")
+        records = record_comparison(runs)
+        if records.empty:
+            st.info("No runs to compare in this period.")
+        else:
+            st.dataframe(pd.DataFrame({
+                "Distance": records["distance"],
+                **{name: records[name].map(format_duration) for name in names},
+                "Fastest": records["leader"].fillna("--"),
+                "By": records["margin_s"].map(
+                    lambda s: format_duration(s) if pd.notna(s) else "--"),
+            }), hide_index=True, width="stretch")
+            st.caption("Fastest pace held over a whole run of at least each distance, "
+                       "carried over exactly that distance. \"By\" is the gap to second place.")
+    with right:
+        st.subheader("Race predictions")
+        predictions = prediction_comparison(runs)
+        st.dataframe(pd.DataFrame({
+            "Distance": predictions["distance"],
+            **{name: predictions[name].map(format_duration) for name in names},
+            "Fastest": predictions["leader"].fillna("--"),
+        }), hide_index=True, width="stretch")
+        st.caption(f"Riegel's model (exponent {RIEGEL_EXPONENT}) from each runner's fastest "
+                   "run of 5 km or more in their last 90 days of the period.")
+
+    st.subheader("Runs together")
+    friend = (chosen[0] if len(chosen) == 1 else
+              st.selectbox("Runs with", chosen, key="h2h_shared_friend"))
+    shared = shared_runs(runs[me], runs[friend])
+    if shared.empty:
+        st.info(f"No runs in this period where you and {friend} started within a few "
+                "minutes of each other over much the same distance.")
+        return
+    faster = int((shared["pace_gap_s"] > 0).sum())
+    cards = st.columns(3)
+    cards[0].metric("Runs together", f"{len(shared):,}")
+    cards[1].metric(f"{me} faster", f"{faster} of {len(shared)}")
+    cards[2].metric("Average gap", f"{abs(units.pace(shared['pace_gap_s'].mean())):.0f} "
+                                   f"s/{units.distance_label}",
+                    delta=f"{me if shared['pace_gap_s'].mean() >= 0 else friend} faster",
+                    delta_color="off")
+    st.plotly_chart(plots.shared_runs_figure(shared, me, friend, units), width="stretch")
+    st.caption(
+        f"Runs that started within {SHARED_WINDOW_MIN} minutes of each other and differ in "
+        f"distance by at most {SHARED_DISTANCE_TOLERANCE:.0%} -- most likely the same run. Paces still differ: one of you may have warmed up, "
+        "waited at a light, or dropped the other at the end.")
+    st.dataframe(pd.DataFrame({
+        "Date": shared["date"].dt.strftime("%d %b %Y"),
+        "Run": shared["name"],
+        f"{me} distance": shared["distance_km"].map(units.format_distance),
+        f"{friend} distance": shared["other_distance_km"].map(units.format_distance),
+        f"{me} pace": shared["pace_min_per_km"].map(units.format_pace),
+        f"{friend} pace": shared["other_pace_min_per_km"].map(units.format_pace),
+    }).iloc[::-1], hide_index=True, width="stretch")
+
+
 def main() -> None:
     path = choose_source()
     period_box = st.sidebar.container()  # filled once the runs are loaded
@@ -1494,9 +1717,10 @@ def main() -> None:
                    if all_streams is not None else None)
 
     (overview, fitness, race_plan, performance, heart_rate, consistency, all_sports, run_detail,
-     personal, gear, recovery, share) = st.tabs(
+     personal, gear, recovery, friends, share) = st.tabs(
         ["Overview", "Fitness & Freshness", "Race plan", "Performance", "Heart rate", "Consistency",
-         "All sports", "Run detail", "Personal models", "Gear", "Sleep & HRV", "Share"]
+         "All sports", "Run detail", "Personal models", "Gear", "Sleep & HRV", "Head to head",
+         "Share"]
     )
     with overview:
         overview_tab(data)
@@ -1520,6 +1744,8 @@ def main() -> None:
         gear_tab(data)
     with recovery:
         recovery_tab(data, is_sample=path == SAMPLE_CSV)
+    with friends:
+        head_to_head_tab(data, path, start, end)
     with share:
         share_tab(data, stream_data, path)
 

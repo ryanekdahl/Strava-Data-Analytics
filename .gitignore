@@ -8,3 +8,4 @@ data/raw/*
 data/sample/*.csv
 data/sample/activities/
 data/sample/.stream_cache/
+data/sample/friends/
