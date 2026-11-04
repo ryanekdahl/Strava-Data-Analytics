@@ -61,6 +61,15 @@ METRICS: list[tuple[str, str, bool]] = [
     ("fitness", "Fitness (CTL) at period end", True),
 ]
 
+# What the distance race and weekly battles can be fought on: key -> label.
+# Every key is a column of :func:`period_weeks`.
+RACE_MEASURES: dict[str, str] = {
+    "distance_km": "Distance",
+    "hours": "Time on feet",
+    "elevation_m": "Elevation gain",
+    "runs": "Runs",
+}
+
 
 def friend_name(path: Path) -> str:
     """The display name for a friend's export: the file's stem, or its folder's name."""
@@ -85,6 +94,20 @@ def safe_file_stem(name: str) -> str:
     return stem
 
 
+def remove_friend_export(path: str | Path, folder: str | Path = FRIENDS_DIR) -> None:
+    """Delete a friend's export, refusing anything outside ``folder``.
+
+    A ``<name>/activities.csv`` export loses only that file; the folder is
+    removed too if nothing else is left in it.
+    """
+    path, folder = Path(path).resolve(), Path(folder).resolve()
+    if folder not in path.parents:
+        raise ValueError(f"{path} is not a friend's export in {folder}.")
+    path.unlink()
+    if path.parent != folder and not any(path.parent.iterdir()):
+        path.parent.rmdir()
+
+
 def save_friend_export(content: bytes, name: str, folder: str | Path = FRIENDS_DIR) -> Path:
     """Save an uploaded export as ``<folder>/<name>.csv`` and return its path."""
     folder = Path(folder)
@@ -99,9 +122,17 @@ def cut_period(frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> p
     return frame[(frame["date"] >= start) & (frame["date"] < end)].reset_index(drop=True)
 
 
+def _run_measures(runs: pd.DataFrame) -> pd.DataFrame:
+    """One row per run with every :data:`RACE_MEASURES` column."""
+    return pd.DataFrame({"date": runs["date"], "distance_km": runs["distance_km"],
+                         "hours": runs["moving_time_s"] / 3600.0,
+                         "elevation_m": runs["elevation_gain_m"].fillna(0.0),
+                         "runs": 1})
+
+
 def period_weeks(activities: pd.DataFrame, start: pd.Timestamp,
                  end: pd.Timestamp) -> pd.DataFrame:
-    """Distance and runs per Monday-start week across the whole period, zero-filled.
+    """Every :data:`RACE_MEASURES` total per Monday-start week across the period, zero-filled.
 
     Unlike :func:`src.consistency.weekly_volume` the weeks span the period, not
     just the athlete's first to last run, so two athletes get the same weeks.
@@ -109,11 +140,12 @@ def period_weeks(activities: pd.DataFrame, start: pd.Timestamp,
     weeks = pd.date_range(start.normalize() - pd.Timedelta(days=start.weekday()),
                           end - pd.Timedelta(days=1), freq="W-MON")
     if activities.empty:
-        return pd.DataFrame({"week_start": weeks, "distance_km": 0.0, "runs": 0})
-    week_start = (activities["date"].dt.normalize()
-                  - pd.to_timedelta(activities["date"].dt.weekday, unit="D"))
-    grouped = activities.groupby(week_start).agg(distance_km=("distance_km", "sum"),
-                                                 runs=("activity_id", "count"))
+        return pd.DataFrame({"week_start": weeks, "distance_km": 0.0, "hours": 0.0,
+                             "elevation_m": 0.0, "runs": 0})
+    measures = _run_measures(activities)
+    week_start = (measures["date"].dt.normalize()
+                  - pd.to_timedelta(measures["date"].dt.weekday, unit="D"))
+    grouped = measures.drop(columns="date").groupby(week_start).sum()
     grouped = grouped.reindex(weeks, fill_value=0)
     return grouped.rename_axis("week_start").reset_index()
 
@@ -221,34 +253,35 @@ def prediction_comparison(runs_by_name: dict[str, pd.DataFrame],
 
 
 def weekly_battles(runs_by_name: dict[str, pd.DataFrame], start: pd.Timestamp,
-                   end: pd.Timestamp) -> pd.DataFrame:
-    """Distance per week for every athlete side by side, and who ran furthest.
+                   end: pd.Timestamp, measure: str = "distance_km") -> pd.DataFrame:
+    """One :data:`RACE_MEASURES` total per week for every athlete side by side, and who led.
 
     Returns ``DataFrame[week_start, <athlete>..., leader]``; a week nobody ran
     has no leader.
     """
     names = list(runs_by_name)
     wide = pd.DataFrame({name: period_weeks(runs, start, end).set_index("week_start")
-                         ["distance_km"] for name, runs in runs_by_name.items()})
+                         [measure] for name, runs in runs_by_name.items()})
     wide["leader"] = [leader(row.where(row > 0), True) for _, row in wide[names].iterrows()]
     return wide.rename_axis("week_start").reset_index()
 
 
-def cumulative_distance(runs_by_name: dict[str, pd.DataFrame], start: pd.Timestamp,
-                        end: pd.Timestamp) -> pd.DataFrame:
-    """Running total of distance per day through the period, one row per athlete-day.
+def cumulative_totals(runs_by_name: dict[str, pd.DataFrame], start: pd.Timestamp,
+                      end: pd.Timestamp, measure: str = "distance_km") -> pd.DataFrame:
+    """Running total of one :data:`RACE_MEASURES` per day through the period.
 
-    Returns ``DataFrame[date, athlete, distance_km]``.
+    Returns ``DataFrame[date, athlete, <measure>]``, one row per athlete-day.
     """
     days = pd.date_range(start.normalize(), end - pd.Timedelta(days=1), freq="D")
     frames = []
     for name, runs in runs_by_name.items():
-        daily = (runs.groupby(runs["date"].dt.normalize())["distance_km"].sum()
+        measures = _run_measures(runs)
+        daily = (measures.groupby(measures["date"].dt.normalize())[measure].sum()
                  .reindex(days, fill_value=0.0).cumsum())
         frames.append(pd.DataFrame({"date": days, "athlete": name,
-                                    "distance_km": daily.to_numpy()}))
+                                    measure: daily.to_numpy(dtype=float)}))
     if not frames:
-        return pd.DataFrame(columns=["date", "athlete", "distance_km"])
+        return pd.DataFrame(columns=["date", "athlete", measure])
     return pd.concat(frames, ignore_index=True)
 
 

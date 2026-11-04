@@ -8,9 +8,9 @@ import pytest
 
 from src.generate_sample import SAMPLE_FRIENDS, generate_friends, generate_sample
 from src.head_to_head import (
-    METRICS, TIE, athlete_profile, cumulative_distance, find_friend_exports, friend_name,
+    METRICS, TIE, athlete_profile, cumulative_totals, find_friend_exports, friend_name,
     head_to_head_table, leader, period_weeks, prediction_comparison, record_comparison,
-    safe_file_stem, save_friend_export, scoreboard, shared_runs, weekly_battles,
+    remove_friend_export, safe_file_stem, save_friend_export, scoreboard, shared_runs, weekly_battles,
 )
 from src.loader import load_activities
 
@@ -111,14 +111,41 @@ def test_prediction_comparison_orders_runners():
     assert table["Lou"].isna().all()
 
 
-def test_weekly_battles_and_cumulative_distance():
+def test_weekly_battles_and_cumulative_totals():
     runs = {"Me": make_runs([("2024-01-02", 10.0, 3000)]),
             "Kim": make_runs([("2024-01-03", 4.0, 1200), ("2024-01-10", 6.0, 1800)])}
     battles = weekly_battles(runs, START, END)
     assert list(battles["leader"]) == ["Me", "Kim"]
-    total = cumulative_distance(runs, START, END)
+    total = cumulative_totals(runs, START, END)
     assert total.groupby("athlete")["distance_km"].max().to_dict() == {"Me": 10.0, "Kim": 10.0}
     assert len(total) == 2 * 14
+
+
+def test_battles_can_be_fought_on_other_measures():
+    runs = {"Me": make_runs([("2024-01-02", 10.0, 3000)]),
+            "Kim": make_runs([("2024-01-03", 4.0, 1200), ("2024-01-04", 4.0, 1200)])}
+    for measure in ("runs", "elevation_m"):
+        leaders = weekly_battles(runs, START, END, measure)["leader"]
+        assert leaders.iloc[0] == "Kim" and pd.isna(leaders.iloc[1])
+    hours = cumulative_totals(runs, START, END, "hours")
+    assert hours.groupby("athlete")["hours"].max().to_dict() == pytest.approx(
+        {"Me": 3000 / 3600, "Kim": 2400 / 3600})
+
+
+def test_removing_a_friend_stays_inside_the_folder(tmp_path):
+    friends = tmp_path / "friends"
+    path = save_friend_export(b"x", "Jo", friends)
+    (friends / "pat").mkdir()
+    (friends / "pat" / "activities.csv").write_text("x")
+    remove_friend_export(path, friends)
+    remove_friend_export(friends / "pat" / "activities.csv", friends)
+    assert find_friend_exports(friends) == {}
+    assert not (friends / "pat").exists()
+    outside = tmp_path / "mine.csv"
+    outside.write_text("x")
+    with pytest.raises(ValueError):
+        remove_friend_export(outside, friends)
+    assert outside.exists()
 
 
 def test_shared_runs_match_on_start_time_and_distance():

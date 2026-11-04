@@ -39,10 +39,10 @@ from src.generate_sample import (
     friends_are_current, generate_friends, generate_sample, sample_is_current,
 )
 from src.head_to_head import (
-    FRIENDS_DIR, SAMPLE_FRIENDS_DIR, SHARED_DISTANCE_TOLERANCE, SHARED_WINDOW_MIN, TIE,
-    athlete_profile, cumulative_distance, cut_period, find_friend_exports, fitness_comparison,
-    head_to_head_table, prediction_comparison, record_comparison, save_friend_export,
-    scoreboard, shared_runs, weekly_battles,
+    FRIENDS_DIR, METRICS, RACE_MEASURES, SAMPLE_FRIENDS_DIR, SHARED_DISTANCE_TOLERANCE,
+    SHARED_WINDOW_MIN, TIE, athlete_profile, cumulative_totals, cut_period, find_friend_exports,
+    fitness_comparison, head_to_head_table, prediction_comparison, record_comparison,
+    remove_friend_export, save_friend_export, scoreboard, shared_runs, weekly_battles,
 )
 from src.heart_rate import (
     hr_coverage, monthly_zone_hours, run_zone_breakdown, stream_monthly_zone_hours,
@@ -1536,6 +1536,39 @@ def add_friend_form() -> None:
         st.rerun()
 
 
+def remove_friend_form(exports: dict[str, Path]) -> None:
+    """Delete a friend's export from ``data/raw/friends/``."""
+    with st.expander("Remove a friend"):
+        name = st.selectbox("Friend", list(exports), key="friend_remove")
+        if not st.button(f"Remove {name}", key="friend_remove_button"):
+            return
+        try:
+            remove_friend_export(exports[name])
+        except (ValueError, OSError) as err:
+            st.error(f"Could not remove {name}: {err}")
+            return
+        # Widgets still holding the name would no longer match their options.
+        chosen = st.session_state.get("h2h_friends")
+        if chosen and name in chosen:
+            st.session_state["h2h_friends"] = [n for n in chosen if n != name]
+        if st.session_state.get("h2h_shared_friend") == name:
+            del st.session_state["h2h_shared_friend"]
+        st.rerun()
+
+
+def race_measure_format(measure: str, units: Units) -> tuple[str, str, str, float]:
+    """Axis title, number format, hover suffix and display scale for a :data:`RACE_MEASURES` key."""
+    if measure == "distance_km":
+        return (f"Distance ({units.distance_label})", ",.1f", f" {units.distance_label}",
+                units.per_km)
+    if measure == "elevation_m":
+        return (f"Elevation gain ({units.elevation_label})", ",.0f", f" {units.elevation_label}",
+                units.per_metre)
+    if measure == "hours":
+        return "Time on feet (h)", ",.1f", " h", 1.0
+    return "Runs", ",.0f", "", 1.0
+
+
 def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timestamp) -> None:
     units = data["units"]
     is_sample = path == SAMPLE_CSV
@@ -1552,6 +1585,8 @@ def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timest
     if not exports:
         st.info("No friends added yet. Add a friend's `activities.csv` above to compare.")
         return
+    if not is_sample:
+        remove_friend_form(exports)
     cols = st.columns([1, 3])
     me = cols[0].text_input("Your name", "You", key="h2h_me").strip() or "You"
     chosen = cols[1].multiselect("Compare with", list(exports),
@@ -1578,9 +1613,16 @@ def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timest
         st.warning(f"{', '.join(idle)} recorded no runs in this period, so they score zero "
                    "on everything below. Try a longer period in the sidebar.")
 
+    labels = {key: label for key, label, _ in METRICS}
+    counted = st.multiselect("Scoreboard categories", list(labels), default=list(labels),
+                             format_func=labels.get, key="h2h_categories")
+    if not counted:
+        st.info("Pick at least one scoreboard category.")
+        return
     profiles = {name: athlete_profile(a["activities"], a["fitness"], start, end)
                 for name, a in athletes.items()}
     table = head_to_head_table(profiles)
+    table = table[table["metric"].isin(counted)].reset_index(drop=True)
     wins = scoreboard(table, names)
     st.subheader("Scoreboard")
     cards = st.columns(len(names))
@@ -1600,17 +1642,22 @@ def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timest
         "compares how hard each of you is training for yourselves, not who is faster -- the "
         "tables below answer that.")
 
+    measure = st.radio("Race on", list(RACE_MEASURES), format_func=RACE_MEASURES.get,
+                       horizontal=True, key="h2h_measure")
+    label = RACE_MEASURES[measure]
+    y_title, fmt, suffix, scale = race_measure_format(measure, units)
     st.plotly_chart(plots.athlete_lines_figure(
-        cumulative_distance(runs, start, end), names, "distance_km",
-        "Distance race through the period", f"Distance ({units.distance_label})", ",.0f",
-        scale=units.per_km), width="stretch")
-    st.caption("Running total of distance from the start of the period. A steeper line is a "
-               "bigger block of training.")
+        cumulative_totals(runs, start, end, measure), names, measure,
+        f"{label} race through the period", y_title, fmt, scale=scale), width="stretch")
+    st.caption(f"Running total of {label.lower()} from the start of the period. A steeper "
+               "line is a bigger block of training.")
 
-    battles = weekly_battles(runs, start, end)
+    battles = weekly_battles(runs, start, end, measure)
     week_wins = battles["leader"].value_counts()
-    st.plotly_chart(plots.weekly_battle_figure(battles, names, units), width="stretch")
-    st.caption("Weeks won (furthest distance): " + ", ".join(
+    st.plotly_chart(plots.weekly_battle_figure(
+        battles, names, f"Weekly {label.lower()}, head to head", y_title, fmt, suffix, scale),
+        width="stretch")
+    st.caption(f"Weeks won (most {label.lower()}): " + ", ".join(
         f"**{name}** {int(week_wins.get(name, 0))}" for name in names)
         + (f", tied {int(week_wins[TIE])}" if TIE in week_wins else "")
         + f" of {len(battles)} weeks.")
@@ -1653,10 +1700,17 @@ def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timest
     st.subheader("Runs together")
     friend = (chosen[0] if len(chosen) == 1 else
               st.selectbox("Runs with", chosen, key="h2h_shared_friend"))
-    shared = shared_runs(runs[me], runs[friend])
+    cols = st.columns(2)
+    window = cols[0].slider("Started within (minutes)", 1, 60, SHARED_WINDOW_MIN,
+                            key="h2h_window")
+    tolerance = cols[1].slider("Distances differ by at most", 5, 50,
+                               round(SHARED_DISTANCE_TOLERANCE * 100), step=5, format="%d%%",
+                               key="h2h_tolerance") / 100
+    shared = shared_runs(runs[me], runs[friend], window, tolerance)
     if shared.empty:
-        st.info(f"No runs in this period where you and {friend} started within a few "
-                "minutes of each other over much the same distance.")
+        st.info(f"No runs in this period where you and {friend} started within {window} "
+                f"minutes of each other and differ in distance by at most {tolerance:.0%}. "
+                "Try loosening the matching above.")
         return
     faster = int((shared["pace_gap_s"] > 0).sum())
     cards = st.columns(3)
@@ -1668,8 +1722,8 @@ def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timest
                     delta_color="off")
     st.plotly_chart(plots.shared_runs_figure(shared, me, friend, units), width="stretch")
     st.caption(
-        f"Runs that started within {SHARED_WINDOW_MIN} minutes of each other and differ in "
-        f"distance by at most {SHARED_DISTANCE_TOLERANCE:.0%} -- most likely the same run. Paces still differ: one of you may have warmed up, "
+        f"Runs that started within {window} minutes of each other and differ in "
+        f"distance by at most {tolerance:.0%} -- most likely the same run. Paces still differ: one of you may have warmed up, "
         "waited at a light, or dropped the other at the end.")
     st.dataframe(pd.DataFrame({
         "Date": shared["date"].dt.strftime("%d %b %Y"),

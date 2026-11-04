@@ -13,6 +13,8 @@ import pytest
 pytest.importorskip("streamlit.testing.v1")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
+from src.head_to_head import METRICS  # noqa: E402
+
 APP = Path(__file__).resolve().parent.parent / "app.py"
 TIMEOUT_S = 600
 
@@ -121,3 +123,17 @@ def test_head_to_head_tab_compares_sample_friends(app):
     app.multiselect(key="h2h_friends").set_value(["Alex", "Sam"]).run()
     app.selectbox(key="h2h_shared_friend").set_value("Sam").run()
     _assert_clean(app)
+    for measure in ("hours", "elevation_m", "runs", "distance_km"):
+        app.radio(key="h2h_measure").set_value(measure).run()
+        _assert_clean(app)
+    app.multiselect(key="h2h_categories").set_value(["distance_km", "runs"]).run()
+    _assert_clean(app)
+    assert any(m.value.endswith("of 2") for m in app.metric)
+    app.multiselect(key="h2h_categories").set_value([]).run()
+    _assert_clean(app)
+    app.multiselect(key="h2h_categories").set_value([key for key, _, _ in METRICS]).run()
+    app.slider(key="h2h_window").set_value(1).run()
+    app.slider(key="h2h_tolerance").set_value(5).run()
+    _assert_clean(app)
+    app.slider(key="h2h_window").set_value(15).run()
+    app.slider(key="h2h_tolerance").set_value(15).run()

@@ -846,21 +846,19 @@ def athlete_lines_figure(frame: pd.DataFrame, names: list[str], y: str, title: s
     return _base(fig, height=380, y_title=y_title, right=120)
 
 
-def weekly_battle_figure(battles: pd.DataFrame, names: list[str],
-                         units: Units = METRIC) -> go.Figure:
-    """Distance per week for each athlete, bars side by side."""
-    label = units.distance_label
+def weekly_battle_figure(battles: pd.DataFrame, names: list[str], title: str, y_title: str,
+                         hover_fmt: str, suffix: str = "", scale: float = 1.0) -> go.Figure:
+    """One weekly total per athlete, bars side by side; ``scale`` converts to display units."""
     fig = go.Figure()
     for index, name in enumerate(names):
         fig.add_trace(go.Bar(
-            x=battles["week_start"], y=units.distance(battles[name]), name=name,
+            x=battles["week_start"], y=battles[name] * scale, name=name,
             marker=dict(color=athlete_color(index), cornerradius=3),
-            hovertemplate=f"{name}: %{{y:.1f}} {label}<extra></extra>",
+            hovertemplate=f"{name}: %{{y:{hover_fmt}}}{suffix}<extra></extra>",
         ))
-    fig.update_layout(title="Weekly distance, head to head", barmode="group", bargap=0.2,
-                      bargroupgap=0.05)
+    fig.update_layout(title=title, barmode="group", bargap=0.2, bargroupgap=0.05)
     fig.update_xaxes(hoverformat="Week of %d %b %Y")
-    return _base(fig, height=360, y_title=f"Distance ({label})")
+    return _base(fig, height=360, y_title=y_title)
 
 
 def shared_runs_figure(shared: pd.DataFrame, you: str, friend: str,
