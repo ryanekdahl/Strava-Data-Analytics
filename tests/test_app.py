@@ -137,3 +137,20 @@ def test_head_to_head_tab_compares_sample_friends(app):
     _assert_clean(app)
     app.slider(key="h2h_window").set_value(15).run()
     app.slider(key="h2h_tolerance").set_value(15).run()
+
+
+def test_pace_zones_tab_and_grade_adjusted_pace(app):
+    assert any(tab.label == "Pace zones" for tab in app.tabs)
+    threshold = next(m for m in app.metric if m.label == "Threshold pace")
+    assert threshold.value.endswith("/km")
+    gap = next(m for m in app.metric if m.label == "Grade-adjusted pace")
+    assert gap.value != "--"
+    app.radio(key="units").set_value("Miles").run()
+    _assert_clean(app)
+    assert next(m for m in app.metric if m.label == "Threshold pace").value.endswith("/mi")
+    app.radio(key="units").set_value("Kilometres").run()
+
+
+def test_run_detail_lines_up_hills_with_pace_and_heart_rate(app):
+    assert any(h.value.startswith("Hills") for h in app.subheader)
+    assert any("On the climbs you ran" in m.value for m in app.markdown)

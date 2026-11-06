@@ -18,6 +18,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from src.consistency import SWEET_SPOT
 from src.performance import format_pace
@@ -66,19 +67,24 @@ def _base(
     return fig
 
 
-def _pace_axis(fig: go.Figure, paces: pd.Series) -> None:
-    """Reverse the y-axis and tick it every 15 s of pace, labelled ``m:ss``."""
+def _pace_axis(fig: go.Figure, paces: pd.Series, **where) -> None:
+    """Reverse the y-axis and tick it every 15 s of pace, labelled ``m:ss``.
+
+    ``where`` (``row=``, ``col=``) picks one subplot's axis instead of all.
+    """
     finite = pd.Series(paces).replace([np.inf, -np.inf], np.nan).dropna()
     if finite.empty:
         return
     low = np.floor(finite.min() * 4) / 4
     high = np.ceil(finite.max() * 4) / 4
-    ticks = np.arange(low, high + 0.25, 0.25)
+    step = 0.25 if high - low <= 3 else 1.0
+    ticks = np.arange(low, high + step, step)
     fig.update_yaxes(
         autorange="reversed",
         tickmode="array",
         tickvals=ticks,
         ticktext=[format_pace(t, suffix="") for t in ticks],
+        **where,
     )
 
 
@@ -238,16 +244,32 @@ def acwr_figure(acwr: pd.DataFrame) -> go.Figure:
 def rolling_pace_figure(
     rolling: pd.DataFrame, window_days: int = 30, units: Units = METRIC
 ) -> go.Figure:
-    """Distance-weighted rolling average pace -- the "am I getting faster?" chart."""
+    """Distance-weighted rolling average pace -- the "am I getting faster?" chart.
+
+    When ``rolling`` carries a ``rolling_gap`` column with any values, the
+    grade-adjusted pace is drawn alongside as a second line.
+    """
     pace = units.pace(rolling["rolling_pace"])
+    has_gap = bool("rolling_gap" in rolling and rolling["rolling_gap"].notna().any())
     fig = go.Figure(go.Scatter(
         x=rolling["date"], y=pace, mode="lines",
-        line=dict(color=SERIES["fitness"], width=2), name="Rolling pace",
-        hovertemplate=f"%{{y:.2f}} {units.pace_label}<extra></extra>",
+        line=dict(color=SERIES["fitness"], width=2), name="Pace",
+        customdata=[units.format_pace(p) for p in rolling["rolling_pace"]],
+        hovertemplate="Pace %{customdata}<extra></extra>",
     ))
-    fig.update_layout(title=f"Rolling {window_days}-day average pace", showlegend=False)
+    shown = [pace]
+    if has_gap:
+        gap = units.pace(rolling["rolling_gap"])
+        shown.append(gap)
+        fig.add_trace(go.Scatter(
+            x=rolling["date"], y=gap, mode="lines",
+            line=dict(color=SERIES["fatigue"], width=2), name="Grade-adjusted pace",
+            customdata=[units.format_pace(p) for p in rolling["rolling_gap"]],
+            hovertemplate="GAP %{customdata}<extra></extra>",
+        ))
+    fig.update_layout(title=f"Rolling {window_days}-day average pace", showlegend=has_gap)
     _base(fig, height=340, y_title=f"Pace ({units.pace_label})")
-    _pace_axis(fig, pace)
+    _pace_axis(fig, pd.concat(shown))
     return fig
 
 
@@ -273,18 +295,24 @@ def heart_rate_figure(hr: pd.DataFrame, window_days: int = 30) -> go.Figure:
 ZONE_COLORS = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
 
 
-def zone_distribution_figure(zones: pd.DataFrame) -> go.Figure:
-    """Share of heart-rate-recorded time per zone, one bar per zone."""
+def zone_distribution_figure(zones: pd.DataFrame, title: str = "Time in heart-rate zone",
+                             range_column: str = "bpm", range_suffix: str = " bpm"
+                             ) -> go.Figure:
+    """Share of recorded time per zone, one bar per zone.
+
+    ``range_column`` holds each zone's boundaries as text (``bpm`` for heart
+    rate, ``pace`` for pace zones), shown in the hover with ``range_suffix``.
+    """
     fig = go.Figure(go.Bar(
         x=zones["label"], y=zones["share"] * 100.0,
         marker=dict(color=ZONE_COLORS[:len(zones)], cornerradius=4),
-        customdata=np.stack([zones["bpm"], zones["hours"], zones["runs"]], axis=-1),
+        customdata=np.stack([zones[range_column], zones["hours"], zones["runs"]], axis=-1),
         text=[f"{share:.0%}" for share in zones["share"]], textposition="outside",
         textfont=dict(color=INK_SECONDARY),
-        hovertemplate=("%{x} (%{customdata[0]} bpm)<br>%{y:.0f}% of time, "
+        hovertemplate=(f"%{{x}} (%{{customdata[0]}}{range_suffix})<br>%{{y:.0f}}% of time, "
                        "%{customdata[1]:.1f} h over %{customdata[2]} runs<extra></extra>"),
     ))
-    fig.update_layout(title="Time in heart-rate zone", showlegend=False,
+    fig.update_layout(title=title, showlegend=False,
                       hovermode="closest", bargap=0.25)
     _base(fig, height=360, y_title="Share of time (%)")
     fig.update_yaxes(range=[0, max(float(zones["share"].max()) * 115.0, 10.0)])
@@ -464,11 +492,12 @@ def pace_curve_figure(
     return fig
 
 
-def zone_method_figure(average_method: pd.DataFrame, stream_method: pd.DataFrame) -> go.Figure:
-    """Share of time per zone by the average-HR shortcut vs second-by-second HR."""
+def zone_method_figure(average_method: pd.DataFrame, stream_method: pd.DataFrame,
+                       average_name: str = "Whole run at its average HR") -> go.Figure:
+    """Share of time per zone by the whole-run-average shortcut vs second by second."""
     fig = go.Figure()
     for frame, name, color in (
-        (average_method, "Whole run at its average HR", SERIES["fatigue"]),
+        (average_method, average_name, SERIES["fatigue"]),
         (stream_method, "Second by second", SERIES["fitness"]),
     ):
         fig.add_trace(go.Bar(
@@ -482,24 +511,42 @@ def zone_method_figure(average_method: pd.DataFrame, stream_method: pd.DataFrame
 
 
 def splits_figure(splits: pd.DataFrame, units: Units = METRIC) -> go.Figure:
-    """Pace per kilometre (or mile) for one run, heart rate in the hover."""
+    """Pace per kilometre (or mile) for one run, heart rate in the hover.
+
+    Grade-adjusted pace is drawn as a second line when the splits have it.
+    """
     hr_text = [f"{hr:.0f} bpm" if np.isfinite(hr) else "no HR"
                for hr in splits["avg_hr"].astype("float64")]
     pace = units.pace(splits["pace_min_per_km"].astype("float64"))
+    gap_raw = (splits["gap_pace_min_per_km"].astype("float64")
+               if "gap_pace_min_per_km" in splits else pd.Series(np.nan, index=splits.index))
+    has_gap = bool(gap_raw.notna().any())
+    gap_text = [f"GAP {units.format_pace(g)}" if np.isfinite(g) else "" for g in gap_raw]
     fig = go.Figure(go.Scatter(
-        x=splits["split"], y=pace, mode="lines+markers",
+        x=splits["split"], y=pace, mode="lines+markers", name="Pace",
         line=dict(color=SERIES["fitness"], width=2),
         marker=dict(color=SERIES["fitness"], size=9, line=dict(width=2, color=SURFACE)),
         customdata=np.stack([[units.format_pace(p) for p in splits["pace_min_per_km"]], hr_text,
-                             units.distance(splits["distance_m"] / 1000.0)], axis=-1),
+                             units.distance(splits["distance_m"] / 1000.0), gap_text], axis=-1),
         hovertemplate=(f"Split %{{x}} (%{{customdata[2]:.2f}} {units.distance_label})"
-                       "<br>%{customdata[0]}<br>%{customdata[1]}<extra></extra>"),
+                       "<br>Pace %{customdata[0]}<br>%{customdata[3]}<br>%{customdata[1]}"
+                       "<extra></extra>"),
     ))
-    fig.update_layout(title=f"Pace per {units.split_label.lower()}", showlegend=False,
+    shown = [pace]
+    if has_gap:
+        gap = units.pace(gap_raw)
+        shown.append(gap)
+        fig.add_trace(go.Scatter(
+            x=splits["split"], y=gap, mode="lines+markers", name="Grade-adjusted pace",
+            line=dict(color=SERIES["fatigue"], width=2),
+            marker=dict(color=SERIES["fatigue"], size=8, line=dict(width=2, color=SURFACE)),
+            hoverinfo="skip",
+        ))
+    fig.update_layout(title=f"Pace per {units.split_label.lower()}", showlegend=has_gap,
                       hovermode="closest")
     _base(fig, height=340, y_title=f"Pace ({units.pace_label})", x_title=units.split_label)
     fig.update_xaxes(dtick=1 if len(splits) <= 25 else 5)
-    _pace_axis(fig, pace)
+    _pace_axis(fig, pd.concat(shown))
     return fig
 
 
@@ -878,3 +925,109 @@ def shared_runs_figure(shared: pd.DataFrame, you: str, friend: str,
                             f"{friend} faster)", showlegend=False, hovermode="closest",
                       bargap=0.3)
     return _base(fig, height=320, y_title=f"Seconds per {units.distance_label}")
+
+
+# Terrain bands: low-chroma tints, so they sit behind the lines without being
+# mistaken for a series colour.  Identity is also carried by the legend and the
+# "+12 m" / "-12 m" labels, never by tint alone.
+CLIMB_FILL = "#f3dcc8"
+DESCENT_FILL = "#d6e4f5"
+TERRAIN_LABEL_LIMIT = 14
+
+
+def terrain_figure(route: pd.DataFrame, segs: pd.DataFrame, units: Units = METRIC) -> go.Figure:
+    """Elevation, pace and heart rate stacked on one distance axis, climbs and
+    descents shaded through all three panels.
+
+    Three panels rather than one chart with three y-scales: each measure keeps
+    its own honest axis, and the shared x-axis and bands do the lining up.
+    """
+    has_hr = bool(route["hr"].notna().any())
+    rows = 3 if has_hr else 2
+    titles = [f"Elevation ({units.elevation_label})", f"Pace ({units.pace_label})"]
+    if has_hr:
+        titles.append("Heart rate (bpm)")
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.07,
+                        row_heights=[0.28, 0.4, 0.32][:rows], subplot_titles=titles)
+    x = units.distance(route["distance_m"] / 1000.0)
+    elevation = route["altitude_m"] * units.per_metre
+
+    fig.add_trace(go.Scatter(
+        x=x, y=elevation, mode="lines", name="Elevation", showlegend=False,
+        line=dict(color=INK_SECONDARY, width=2),
+        hovertemplate=f"%{{y:.0f}} {units.elevation_label}<extra>Elevation</extra>",
+    ), row=1, col=1)
+
+    pace = route["pace_min_per_km"].astype("float64")
+    gap = route["gap_pace_min_per_km"].astype("float64")
+    fig.add_trace(go.Scatter(
+        x=x, y=units.pace(pace), mode="lines", name="Pace",
+        line=dict(color=SERIES["fitness"], width=2),
+        customdata=[units.format_pace(v) for v in pace],
+        hovertemplate="%{customdata}<extra>Pace</extra>",
+    ), row=2, col=1)
+    if gap.notna().any():
+        fig.add_trace(go.Scatter(
+            x=x, y=units.pace(gap), mode="lines", name="Grade-adjusted pace",
+            line=dict(color=INK_SECONDARY, width=2, dash="dot"),
+            customdata=[units.format_pace(v) for v in gap],
+            hovertemplate="%{customdata}<extra>GAP</extra>",
+        ), row=2, col=1)
+    if has_hr:
+        fig.add_trace(go.Scatter(
+            x=x, y=route["hr"], mode="lines", name="Heart rate",
+            line=dict(color=SERIES["fatigue"], width=2),
+            hovertemplate="%{y:.0f} bpm<extra>Heart rate</extra>",
+        ), row=3, col=1)
+
+    # Bands go in after the traces: plotly skips shapes on subplots still empty.
+    for _, seg in segs[segs["kind"] != "flat"].iterrows():
+        fig.add_vrect(x0=units.distance(seg["start_m"] / 1000.0),
+                      x1=units.distance(seg["end_m"] / 1000.0),
+                      fillcolor=CLIMB_FILL if seg["kind"] == "climb" else DESCENT_FILL,
+                      opacity=1.0, layer="below", line_width=0, row="all", col=1)
+
+    # Legend swatches for the bands.
+    for name, fill in (("Climb", CLIMB_FILL), ("Descent", DESCENT_FILL)):
+        if (segs["kind"] == name.lower()).any():
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers", name=name,
+                marker=dict(symbol="square", size=14, color=fill, line=dict(width=1, color=AXIS)),
+            ), row=1, col=1)
+
+    # "+12 m" / "-12 m" over each climb and descent (the biggest ones on a hilly run).
+    hills = segs[segs["kind"] != "flat"]
+    if len(hills) > TERRAIN_LABEL_LIMIT:
+        hills = hills.loc[hills["change_m"].abs().nlargest(TERRAIN_LABEL_LIMIT).index]
+    top = float(np.nanmax(elevation)) if elevation.notna().any() else 0.0
+    for _, seg in hills.iterrows():
+        fig.add_annotation(
+            x=units.distance((seg["start_m"] + seg["end_m"]) / 2000.0), y=top,
+            text=units.format_elevation(seg["change_m"]).replace("-", "−"),
+            showarrow=False, yanchor="bottom", font=dict(size=11, color=INK_SECONDARY),
+            row=1, col=1)
+
+    _base(fig, height=620 if has_hr else 460)
+    fig.update_layout(title="Elevation, pace and heart rate along the run",
+                      hovermode="x unified", margin=dict(t=110))
+    for title in titles:
+        fig.update_annotations(selector=dict(text=title), font=dict(size=12, color=INK_SECONDARY),
+                               xanchor="left", x=0)
+    fig.update_xaxes(title_text="", showline=True, linecolor=AXIS)
+    fig.update_xaxes(title_text=f"Distance ({units.distance_label})", row=rows, col=1)
+    span = float(np.nanmax(elevation) - np.nanmin(elevation)) if elevation.notna().any() else 0
+    pad = max(span * 0.25, 5.0 * units.per_metre)
+    fig.update_yaxes(range=[float(np.nanmin(elevation)) - pad * 0.3,
+                            float(np.nanmax(elevation)) + pad], row=1, col=1)
+    if has_hr:  # the warm-up climb in heart rate should not squash the rest
+        hr = route["hr"].dropna()
+        low, high = hr.quantile(0.02), hr.quantile(0.98)
+        fig.update_yaxes(range=[low - 5, high + 5], row=3, col=1)
+    # GPS pace spikes at turns and stops: scale the pace axis to the middle 96%.
+    shown = units.pace(pd.concat([pace, gap]).dropna())
+    if not shown.empty:
+        low, high = shown.quantile(0.02), shown.quantile(0.98)
+        _pace_axis(fig, pd.Series([low, high]), row=2, col=1)
+        fig.update_yaxes(range=[np.ceil(high * 4) / 4, np.floor(low * 4) / 4],
+                         autorange=False, row=2, col=1)
+    return fig

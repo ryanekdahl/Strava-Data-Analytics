@@ -29,7 +29,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from src import plots, streams
+from src import pace_zones, plots, streams, terrain
 from src.consistency import (
     SWEET_SPOT, acwr_status, compute_acwr, monthly_volume, summary_kpis,
     weekly_streaks, weekly_volume,
@@ -696,7 +696,9 @@ def performance_tab(data: dict, stream_data, riegel) -> None:
     with trend_left:
         st.plotly_chart(plots.rolling_pace_figure(rolling_pace(activities), units=units),
                         width="stretch")
-        st.caption("Average pace over a trailing 30 days, weighted by distance. Higher is faster.")
+        st.caption("Average pace over a trailing 30 days, weighted by distance. Higher is "
+                   "faster. Grade-adjusted pace (GAP) is what the pace would have been on the "
+                   "flat; a GAP line well above the pace line means hilly running.")
     with trend_right:
         st.plotly_chart(plots.heart_rate_figure(rolling_hr(activities)), width="stretch")
         st.caption("Average heart rate per run. A falling line at a steady pace means fitness gains.")
@@ -873,6 +875,91 @@ def run_zone_section(breakdown: pd.DataFrame, activities: pd.DataFrame, units: U
     table["Easy (Z1-Z2)"] = shares[[1, 2]].sum(axis=1).map(lambda s: f"{s:.0%}")
     with st.expander(f"All {len(runs):,} runs with heart rate"):
         st.dataframe(table, hide_index=True, width="stretch")
+
+
+def pace_zones_tab(data: dict, stream_data) -> None:
+    activities, units = data["activities"], data["units"]
+    threshold = data["threshold_pace"]
+    gap_seconds = stream_data.gap_seconds if stream_data is not None else pd.DataFrame()
+    from_streams = not gap_seconds.empty
+    if from_streams:
+        zones = pace_zones.stream_zone_distribution(gap_seconds, threshold, units)
+        monthly = pace_zones.stream_monthly_zone_hours(gap_seconds, threshold)
+        breakdown = pace_zones.stream_run_zone_breakdown(gap_seconds, threshold)
+    else:
+        zones = pace_zones.zone_distribution(activities, threshold, units)
+        monthly = pace_zones.monthly_zone_hours(activities, threshold)
+        breakdown = pace_zones.run_zone_breakdown(activities, threshold)
+    if zones["hours"].sum() == 0:
+        st.info("None of these runs has a pace to put in a zone.")
+        return
+
+    gap_share = float(activities["gap_pace_min_per_km"].notna().mean())
+    easy_share = float(zones.loc[zones["zone"] <= 2, "share"].sum())
+    cards = st.columns(3)
+    cards[0].metric("Threshold pace", units.format_pace(threshold),
+                    help="The fastest tenth of your runs of 5 km or more, on grade-adjusted "
+                         "pace where the export has it -- the same threshold that scores "
+                         "training load.")
+    cards[1].metric("Most time in", zones.loc[zones["hours"].idxmax(), "label"])
+    cards[2].metric("Easy share (Z1-Z2)", f"{easy_share:.0%}")
+    st.caption(
+        "Zones are fractions of your threshold speed, so they move with your fitness. "
+        + (f"Counted second by second from {gap_seconds['activity_id'].nunique():,} GPS "
+           "recordings, on pace corrected for the slope where the recording has altitude."
+           if from_streams else
+           f"Each run counts at its average pace, grade-adjusted for {gap_share:.0%} of runs "
+           "(the rest have no Grade Adjusted Distance in the export).")
+    )
+
+    st.plotly_chart(plots.zone_distribution_figure(zones, "Time in pace zone", "pace", ""),
+                    width="stretch", key="pace_zone_chart")
+    st.caption(
+        "How your running time splits across five pace zones. Compare it with the Heart rate "
+        "tab: if your easy runs land in Z2 by pace but Z3 by heart rate, they are costing more "
+        "than their pace suggests (heat, hills, fatigue), or your zones need new settings."
+    )
+    st.plotly_chart(plots.monthly_zone_figure(monthly), width="stretch",
+                    key="pace_zone_monthly")
+    st.caption("The same split month by month.")
+
+    if not breakdown.empty:
+        st.subheader("Run by run")
+        runs = (activities[activities["activity_id"].isin(breakdown["activity_id"])]
+                .sort_values("date", ascending=False).set_index("activity_id"))
+        labels = pd.Series({a: f"{row.date:%d %b %Y} · {row['name']}" if row["name"]
+                            else f"{row.date:%d %b %Y}" for a, row in runs.iterrows()})
+        shown = (st.slider("Recent runs to chart", 5, min(60, len(runs)), min(20, len(runs)),
+                           key="pace_zone_runs") if len(runs) > 5 else len(runs))
+        recent = breakdown[breakdown["activity_id"].isin(runs.index[:shown])]
+        st.plotly_chart(plots.run_zone_figure(recent, labels), width="stretch",
+                        key="pace_zone_run_chart")
+        st.caption("How each run's time split across the pace zones, newest at the top."
+                   if from_streams else
+                   "Without the GPS recordings each run is credited wholly to the zone of its "
+                   "average pace, so every bar is a single colour.")
+
+    st.dataframe(
+        zones.assign(share=zones["share"].map(lambda v: f"{v:.0%}"),
+                     hours=zones["hours"].map(lambda h: f"{h:.1f}"))
+        .rename(columns={"label": "Zone", "pace": f"Pace ({units.pace_label})", "runs": "Runs",
+                         "hours": "Hours", "share": "Share"})
+        [["Zone", f"Pace ({units.pace_label})", "Runs", "Hours", "Share"]],
+        hide_index=True, width="stretch",
+    )
+
+    if from_streams:
+        same_runs = activities[activities["activity_id"].isin(gap_seconds["activity_id"])]
+        average_method = pace_zones.zone_distribution(same_runs, threshold, units)
+        st.plotly_chart(plots.zone_method_figure(average_method, zones,
+                                                 "Whole run at its average pace"),
+                        width="stretch", key="pace_zone_methods")
+        st.caption(
+            "The same runs counted two ways. An interval session averages out to a middle "
+            "zone; counting each second shows its recovery jogs and its fast reps. \"Runs\" "
+            "in the table counts every run that touched a zone, so it adds up to more than "
+            "the number of runs."
+        )
 
 
 def consistency_tab(data: dict) -> None:
@@ -1132,17 +1219,22 @@ def run_detail_tab(data: dict, stream_data, path: Path) -> None:
     splits = all_splits[all_splits["activity_id"] == activity_id]
     detail = stream_data.runs.set_index("activity_id").loc[activity_id]
 
-    cards = st.columns(6)
+    gap, gap_source = run_gap(run, detail)
+    cards = st.columns(7)
     cards[0].metric("Distance", units.format_distance(run["distance_km"], 2))
     cards[1].metric("Moving time", format_duration(run["moving_time_s"]))
     cards[2].metric("Pace", units.format_pace(run["pace_min_per_km"]))
-    cards[3].metric("Average HR", f"{run['avg_hr']:.0f} bpm" if pd.notna(run["avg_hr"]) else "--")
-    cards[4].metric("Cadence", f"{run['avg_cadence_spm']:.0f} spm"
+    cards[3].metric("Grade-adjusted pace", units.format_pace(gap) if pd.notna(gap) else "--",
+                    help=gap_source)
+    cards[4].metric("Average HR", f"{run['avg_hr']:.0f} bpm" if pd.notna(run["avg_hr"]) else "--")
+    cards[5].metric("Cadence", f"{run['avg_cadence_spm']:.0f} spm"
                     if pd.notna(run["avg_cadence_spm"]) else "--")
     decoupling = detail["decoupling_pct"]
-    cards[5].metric("Aerobic decoupling", f"{decoupling:+.1f}%" if pd.notna(decoupling) else "--")
+    cards[6].metric("Aerobic decoupling", f"{decoupling:+.1f}%" if pd.notna(decoupling) else "--")
 
-    route_map(streams.route_for(activity_id, data["all_activities"], path), units)
+    route = streams.route_for(activity_id, data["all_activities"], path)
+    route_map(route, units)
+    terrain_section(route, units)
 
     left, right = st.columns(2)
     with left:
@@ -1153,6 +1245,10 @@ def run_detail_tab(data: dict, stream_data, path: Path) -> None:
         else:
             st.info("This run was recorded without heart rate.")
     st.caption(
+        "Grade-adjusted pace (GAP) is what each split would have been on the flat: slower than "
+        "your pace on a descent, faster on a climb. Per split it comes from the recording's "
+        "altitude and a stated slope model (see `src/streams.py`), so it can differ a little "
+        "from Strava's own. "
         "Aerobic decoupling compares speed per heartbeat in the first and second half of the "
         "run. Under about 5% on a steady run means your aerobic base held up; a large value "
         "means your heart worked harder for the same speed as the run went on. Interval "
@@ -1163,10 +1259,113 @@ def run_detail_tab(data: dict, stream_data, path: Path) -> None:
         "Distance": (splits["distance_m"] / 1000.0).map(lambda km: units.format_distance(km, 2)),
         "Time": splits["time_s"].map(format_duration),
         "Pace": splits["pace_min_per_km"].map(units.format_pace),
+        "GAP": splits["gap_pace_min_per_km"].map(
+            lambda g: units.format_pace(g) if pd.notna(g) else "--"),
         "Heart rate": splits["avg_hr"].map(lambda h: f"{h:.0f}" if pd.notna(h) else "--"),
         "Cadence": splits["cadence_spm"].map(lambda c: f"{c:.0f}" if pd.notna(c) else "--"),
         "Elevation": splits["elevation_change_m"].map(units.format_elevation),
     }), hide_index=True, width="stretch")
+
+
+def run_gap(run: pd.Series, detail: pd.Series) -> tuple[float, str]:
+    """A run's whole-run grade-adjusted pace and a note saying where it came from.
+
+    Strava's own figure from ``activities.csv`` is preferred; failing that, the
+    equivalent flat distance computed from the GPS recording's altitude.
+    """
+    if pd.notna(run.get("gap_pace_min_per_km")):
+        return float(run["gap_pace_min_per_km"]), "Strava's grade-adjusted pace from the export."
+    flat_m = detail.get("gap_distance_m")
+    if pd.notna(flat_m) and flat_m > 0:
+        return (float(run["moving_time_s"] / 60.0 / (flat_m / 1000.0)),
+                "Estimated from the recording's altitude (the export has no GAP for this run).")
+    return float("nan"), "Neither the export nor the recording has the elevation to adjust for."
+
+
+TERRAIN_NAMES = {"climb": "Climbs", "flat": "Flat", "descent": "Descents"}
+
+
+def terrain_section(route: pd.DataFrame, units: Units) -> None:
+    """Elevation, pace and heart rate lined up, and what the climbs and descents cost."""
+    if route.empty:
+        return
+    st.subheader("Hills: elevation, pace and heart rate")
+    if route["altitude_m"].notna().sum() < 2:
+        st.caption("This recording has no altitude, so there are no hills to line up.")
+        return
+    segs = terrain.segments(route)
+    hills = segs[segs["kind"] != "flat"]
+    if hills.empty:
+        st.caption(f"This run never rose or fell more than "
+                   f"{units.format_elevation(terrain.MIN_CHANGE_M).lstrip('+')} in one go, so "
+                   "it counts as flat.")
+        return
+    st.plotly_chart(plots.terrain_figure(route, segs, units), width="stretch",
+                    key="terrain_chart")
+    st.caption(
+        "All three panels share the distance axis. Orange bands are climbs and blue bands "
+        "descents, shaded through every panel so you can read straight down from a hill to "
+        "what your pace and heart rate did. The dotted line is grade-adjusted pace: if it "
+        "stays level while your pace drops on a climb, you kept your effort even. Heart rate "
+        f"lags effort by about {terrain.HR_LAG_S:.0f} seconds, so it often peaks just after "
+        f"the top of a climb. A climb or descent must rise or fall at least "
+        f"{units.format_elevation(terrain.MIN_CHANGE_M).lstrip('+')}; smaller bumps count as flat."
+    )
+
+    summary = terrain.terrain_summary(segs).set_index("kind")
+    st.markdown(terrain_reading(summary, units))
+    st.dataframe(pd.DataFrame({
+        "Terrain": [TERRAIN_NAMES[k] for k in summary.index],
+        "Stretches": summary["count"].to_numpy(),
+        "Distance": (summary["distance_m"] / 1000.0).map(units.format_distance).to_numpy(),
+        "Share of time": summary["time_share"].map(lambda v: f"{v:.0%}").to_numpy(),
+        "Elevation": summary["change_m"].map(units.format_elevation).to_numpy(),
+        "Pace": summary["pace_min_per_km"].map(units.format_pace).to_numpy(),
+        "GAP": summary["gap_pace_min_per_km"].map(units.format_pace).to_numpy(),
+        "Avg HR": summary["avg_hr"].map(lambda h: f"{h:.0f}" if pd.notna(h) else "--").to_numpy(),
+    }), hide_index=True, width="stretch")
+
+    with st.expander(f"Each climb and descent ({len(hills)})"):
+        st.dataframe(pd.DataFrame({
+            "": hills["kind"].map({"climb": "Climb", "descent": "Descent"}),
+            "From": (hills["start_m"] / 1000.0).map(lambda km: units.format_distance(km, 2)),
+            "Length": (hills["distance_m"] / 1000.0).map(lambda km: units.format_distance(km, 2)),
+            "Elevation": hills["change_m"].map(units.format_elevation),
+            "Grade": hills["grade"].map(lambda g: f"{g:+.1%}"),
+            "Pace": hills["pace_min_per_km"].map(units.format_pace),
+            "GAP": hills["gap_pace_min_per_km"].map(units.format_pace),
+            "Avg HR": hills["avg_hr"].map(lambda h: f"{h:.0f}" if pd.notna(h) else "--"),
+            "HR change": (hills["hr_end"] - hills["hr_start"]).map(
+                lambda h: f"{h:+.0f} bpm" if pd.notna(h) else "--"),
+        }), hide_index=True, width="stretch")
+        st.caption(f"HR change is heart rate {terrain.HR_LAG_S:.0f} s after the end of the "
+                   f"stretch minus {terrain.HR_LAG_S:.0f} s after its start, to allow for the lag.")
+
+
+def terrain_reading(summary: pd.DataFrame, units: Units) -> str:
+    """One plain-English sentence on climbs vs descents (or vs flat when there are no descents)."""
+    if "climb" not in summary.index:
+        return ""
+    other = "descent" if "descent" in summary.index else "flat" if "flat" in summary.index \
+        else None
+    if other is None:
+        return ""
+    climb, rest = summary.loc["climb"], summary.loc[other]
+    word = "descents" if other == "descent" else "flat stretches"
+    pace_gap = (climb["pace_min_per_km"] - rest["pace_min_per_km"]) * 60.0 / units.per_km
+    effort_gap = (climb["gap_pace_min_per_km"] - rest["gap_pace_min_per_km"]) * 60.0 / units.per_km
+    parts = [f"On the climbs you ran **{abs(pace_gap):.0f} s/{units.distance_label} "
+             f"{'slower' if pace_gap > 0 else 'faster'}** than on the {word}"]
+    if pd.notna(effort_gap):
+        parts.append(f"but by grade-adjusted pace your effort was "
+                     + ("**about the same**" if abs(effort_gap) < 5 else
+                        f"**{abs(effort_gap):.0f} s/{units.distance_label} "
+                        f"{'easier' if effort_gap > 0 else 'harder'}**"))
+    sentence = ", ".join(parts)
+    if pd.notna(climb["avg_hr"]) and pd.notna(rest["avg_hr"]):
+        diff = climb["avg_hr"] - rest["avg_hr"]
+        sentence += f"; heart rate averaged **{abs(diff):.0f} bpm {'higher' if diff >= 0 else 'lower'}**"
+    return sentence + "."
 
 
 def route_map(route: pd.DataFrame, units: Units) -> None:
@@ -1770,11 +1969,11 @@ def main() -> None:
     stream_data = (streams.restrict(all_streams, activities["activity_id"])
                    if all_streams is not None else None)
 
-    (overview, fitness, race_plan, performance, heart_rate, consistency, all_sports, run_detail,
-     personal, gear, recovery, friends, share) = st.tabs(
-        ["Overview", "Fitness & Freshness", "Race plan", "Performance", "Heart rate", "Consistency",
-         "All sports", "Run detail", "Personal models", "Gear", "Sleep & HRV", "Head to head",
-         "Share"]
+    (overview, fitness, race_plan, performance, heart_rate, pace, consistency, all_sports,
+     run_detail, personal, gear, recovery, friends, share) = st.tabs(
+        ["Overview", "Fitness & Freshness", "Race plan", "Performance", "Heart rate",
+         "Pace zones", "Consistency", "All sports", "Run detail", "Personal models", "Gear",
+         "Sleep & HRV", "Head to head", "Share"]
     )
     with overview:
         overview_tab(data)
@@ -1786,6 +1985,8 @@ def main() -> None:
         performance_tab(data, stream_data, riegel)
     with heart_rate:
         heart_rate_tab(data, stream_data)
+    with pace:
+        pace_zones_tab(data, stream_data)
     with consistency:
         consistency_tab(data)
     with all_sports:

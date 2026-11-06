@@ -227,15 +227,30 @@ def rolling_pace(activities: pd.DataFrame, window_days: int = 30) -> pd.DataFram
 
     Weighting by distance stops a 3 km shakeout from moving the average as much
     as a 20 km long run, so the trend tracks fitness, not run selection.
+
+    ``rolling_gap`` is the same average on grade-adjusted pace: moving time over
+    equivalent flat distance (``moving_time / gap_pace``), counting only runs
+    whose export carries GAP.  It is NaN where the window holds none.
     """
+    columns = ["date", "rolling_pace", "rolling_gap"]
     if activities.empty:
-        return pd.DataFrame(columns=["date", "rolling_pace"])
-    frame = activities[["date", "distance_km", "moving_time_s"]].dropna().set_index("date")
+        return pd.DataFrame(columns=columns)
+    frame = activities[["date", "distance_km", "moving_time_s"]].dropna()
+    gap_pace = (activities.loc[frame.index, "gap_pace_min_per_km"]
+                if "gap_pace_min_per_km" in activities else pd.Series(np.nan, index=frame.index))
+    minutes_all = frame["moving_time_s"] / 60.0
+    frame = frame.assign(
+        gap_km=(minutes_all / gap_pace).where(gap_pace > 0),
+        gap_minutes=minutes_all.where(gap_pace > 0),
+    ).set_index("date")
     window = f"{window_days}D"
     distance = frame["distance_km"].rolling(window).sum()
     minutes = (frame["moving_time_s"] / 60.0).rolling(window).sum()
+    gap_km = frame["gap_km"].fillna(0.0).rolling(window).sum()
+    gap_minutes = frame["gap_minutes"].fillna(0.0).rolling(window).sum()
     return pd.DataFrame({
         "date": frame.index, "rolling_pace": (minutes / distance).to_numpy(),
+        "rolling_gap": (gap_minutes / gap_km.where(gap_km > 0)).to_numpy(),
     }).reset_index(drop=True)
 
 

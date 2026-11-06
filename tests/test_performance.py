@@ -142,6 +142,15 @@ def test_rolling_pace_weights_by_distance():
     assert rolled["rolling_pace"].iloc[1] < 5.2  # nowhere near the 6:00/km shakeout
 
 
+def test_rolling_gap_uses_equivalent_flat_distance_and_skips_runs_without_gap():
+    runs = make_runs([("2024-01-01", 10.0, 3000), ("2024-01-02", 10.0, 3000)])
+    runs["gap_pace_min_per_km"] = [4.0, np.nan]  # hilly first run, no GAP on the second
+    rolled = rolling_pace(runs, window_days=30)
+    assert rolled["rolling_gap"].tolist() == pytest.approx([4.0, 4.0])
+    assert rolled["rolling_pace"].iloc[1] == pytest.approx(5.0)
+    assert rolling_pace(runs.drop(columns="gap_pace_min_per_km"))["rolling_gap"].isna().all()
+
+
 def test_formatters_cover_hours_and_missing_values():
     assert format_duration(3661) == "1:01:01"
     assert format_duration(59.6) == "1:00"

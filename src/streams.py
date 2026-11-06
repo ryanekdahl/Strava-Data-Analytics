@@ -13,6 +13,9 @@ turn three activity-level approximations into real measurements:
 * **Splits and drift.**  Per-kilometre (and per-mile) pace, heart rate and
   elevation, and aerobic decoupling -- how much the speed-to-heart-rate ratio
   fades from the first half of a run to the second.
+* **Grade-adjusted pace.**  Per-split pace corrected for the slope, and a
+  histogram of grade-adjusted speed for time in pace zone (see "Grade-adjusted
+  pace" below).
 * **Route maps.**  A thinned copy of the GPS track, one point per equal slice
   of distance, for drawing the run with its pace or heart rate along the way.
 
@@ -45,6 +48,27 @@ GPS glitches are the main threat to a best effort -- one bad fix can teleport a
 runner 200 m in a second.  Any step implying more than
 :data:`MAX_SPEED_M_S` (faster than any human sprints) is clipped to that speed
 before the search, so a glitch can shorten a best effort only negligibly.
+
+Grade-adjusted pace
+-------------------
+Running uphill costs more than running on the flat, and gentle downhills cost
+less.  Each stretch of the run is credited with an *equivalent flat distance*
+``distance * cost(grade)``, where ``cost`` is a quadratic in grade ``g``::
+
+    cost(g) = 1 + 2.4 g + 12 g**2      (g clipped to +/-30%)
+
+It is the shape Strava describes for its own model: cheapest, about 12% below
+flat, near a -10% grade, back to flat cost near -20% (steep descents need
+braking), and 36% dearer at +10%.  The constants are an approximation of that
+curve, not Strava's own numbers, so whole-run GAP from ``activities.csv`` is
+preferred where the export has it.  Grade is measured on altitude resampled
+every :data:`GRADE_STEP_M` metres and smoothed over :data:`GRADE_WINDOW_M`, so
+GPS altitude noise does not read as a staircase of steep ramps.  Without
+altitude the cost is 1 and grade-adjusted pace equals pace.
+
+Grade-adjusted *speed* at each sample is the equivalent distance covered over a
+:data:`SPEED_WINDOW_S`-second window of moving time centred on it -- one GPS fix
+to the next is far too noisy to read a pace from.
 """
 
 from __future__ import annotations
@@ -64,7 +88,7 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 CACHE_DIR_NAME = ".stream_cache"
-CACHE_VERSION = 2  # bump when the summary format or any computation changes
+CACHE_VERSION = 4  # bump when the summary format or any computation changes
 
 STREAM_COLUMNS = ["t_s", "distance_m", "hr", "cadence_spm", "altitude_m", "lat", "lon"]
 
@@ -73,7 +97,13 @@ STOP_SPEED_M_S = 0.5  # slower than a shuffle: standing at a light, not running
 MIN_DECOUPLING_MINUTES = 20.0
 MILE_M = 1609.344
 ROUTE_POINTS = 300  # points kept per route: smooth on a map, ~10 KB per run in the cache
-ROUTE_COLUMNS = ["lat", "lon", "distance_m", "moving_s", "hr"]
+ROUTE_COLUMNS = ["lat", "lon", "distance_m", "moving_s", "hr", "altitude_m"]
+GRADE_STEP_M = 10.0  # altitude is resampled every 10 m of distance...
+GRADE_WINDOW_M = 50.0  # ...and smoothed over 50 m before grade is taken
+MAX_GRADE = 0.30
+GAP_LINEAR, GAP_QUADRATIC = 2.4, 12.0  # cost(g) = 1 + 2.4 g + 12 g^2
+SPEED_WINDOW_S = 30.0  # grade-adjusted speed is read over 30 s of moving time
+SPEED_BIN_M_S = 0.1  # resolution of the stored speed histogram
 _EARTH_RADIUS_M = 6_371_008.8
 
 # Named distances shown in the best-effort table.
@@ -104,16 +134,22 @@ class StreamData(NamedTuple):
 
     ``best``        long ``DataFrame[activity_id, date, distance_m, time_s]``
     ``hr_seconds``  long ``DataFrame[activity_id, date, bpm, seconds]``
+    ``gap_seconds`` long ``DataFrame[activity_id, date, speed_m_s, seconds]`` --
+                    moving seconds at each grade-adjusted speed (0.1 m/s bins)
     ``splits``      ``DataFrame[activity_id, split, distance_m, time_s,
-                    pace_min_per_km, avg_hr, cadence_spm, elevation_change_m]``
+                    pace_min_per_km, gap_pace_min_per_km, avg_hr, cadence_spm,
+                    elevation_change_m]`` -- GAP is NaN without altitude
     ``mile_splits`` the same, one row per mile (pace still in min/km)
     ``runs``        ``DataFrame[activity_id, duration_s, moving_s, distance_m,
-                    decoupling_pct, has_hr]`` -- one row per parsed file
+                    gap_distance_m, decoupling_pct, has_hr]`` -- one row per
+                    parsed file; ``gap_distance_m`` is the equivalent flat
+                    distance, NaN without altitude
     ``status``      counts of ``parsed``, ``failed`` and ``missing`` files
     """
 
     best: pd.DataFrame
     hr_seconds: pd.DataFrame
+    gap_seconds: pd.DataFrame
     splits: pd.DataFrame
     mile_splits: pd.DataFrame
     runs: pd.DataFrame
@@ -432,14 +468,82 @@ def hr_histogram(stream: pd.DataFrame) -> dict[int, float]:
     return {int(bpm): float(sec) for bpm, sec in totals.items()}
 
 
+def grade_cost(grade) -> np.ndarray:
+    """Energy cost of running at ``grade`` relative to the flat (see "Grade-adjusted pace")."""
+    g = np.clip(np.asarray(grade, dtype="float64"), -MAX_GRADE, MAX_GRADE)
+    return 1.0 + GAP_LINEAR * g + GAP_QUADRATIC * g ** 2
+
+
+def equivalent_distance(stream: pd.DataFrame, distance_m: np.ndarray | None = None
+                        ) -> np.ndarray | None:
+    """Cumulative equivalent flat distance at each sample; ``None`` without altitude.
+
+    ``distance_m`` is the cleaned cumulative distance (computed when omitted).
+    """
+    d = (clean_distance(stream["t_s"].to_numpy(dtype="float64"),
+                        stream["distance_m"].to_numpy(dtype="float64"))
+         if distance_m is None else np.asarray(distance_m, dtype="float64"))
+    altitude = stream["altitude_m"].to_numpy(dtype="float64")
+    has_alt = ~np.isnan(altitude)
+    if has_alt.sum() < 2 or d[-1] - d[0] < GRADE_STEP_M:
+        return None
+    # np.interp needs strictly increasing x: keep the first sample at each distance.
+    xd, xa = d[has_alt], altitude[has_alt]
+    first = np.concatenate([[True], np.diff(xd) > 0])
+    xd, xa = xd[first], xa[first]
+    if len(xd) < 2:
+        return None
+    grid = np.arange(d[0], d[-1] + GRADE_STEP_M, GRADE_STEP_M)
+    alt = np.interp(grid, xd, xa)
+    width = max(int(round(GRADE_WINDOW_M / GRADE_STEP_M)), 1)
+    if len(alt) > width:
+        padded = np.pad(alt, (width // 2, width - 1 - width // 2), mode="edge")
+        alt = np.convolve(padded, np.ones(width) / width, mode="valid")
+    grade = np.gradient(alt, grid) if len(grid) > 1 else np.zeros(1)
+    cost = grade_cost(grade)
+    # Integrate the cost along the grid (trapezoid), then read it off at each sample.
+    steps = np.diff(grid) * (cost[:-1] + cost[1:]) / 2.0
+    cumulative = np.concatenate([[0.0], np.cumsum(steps)])
+    return np.interp(d, grid, cumulative)
+
+
+def gap_speed_histogram(stream: pd.DataFrame) -> dict[int, float]:
+    """Moving seconds at each grade-adjusted speed, keyed by speed in 0.1 m/s bins.
+
+    Like :func:`hr_histogram`, the histogram rather than zone totals is stored,
+    so pace zones can be redrawn for any threshold pace without re-reading
+    files.  Uses plain speed when the recording has no altitude.
+    """
+    if len(stream) < 2:
+        return {}
+    t, d = _moving(stream)
+    e = equivalent_distance(stream, d)
+    if e is None:
+        e = d
+    seconds = _sample_seconds(t)
+    half = SPEED_WINDOW_S / 2.0
+    hi = np.clip(np.searchsorted(t, t + half, side="right") - 1, 0, len(t) - 1)
+    lo = np.clip(np.searchsorted(t, t - half, side="left"), 0, len(t) - 1)
+    span = t[hi] - t[lo]
+    speed = np.divide(e[hi] - e[lo], span, out=np.zeros_like(span), where=span > 0)
+    valid = (seconds > 0) & (span > 0) & (speed >= STOP_SPEED_M_S)
+    if not valid.any():
+        return {}
+    bins = np.rint(np.minimum(speed[valid], MAX_SPEED_M_S * 2) / SPEED_BIN_M_S).astype(int)
+    totals = pd.Series(seconds[valid]).groupby(bins).sum()
+    return {int(b): float(sec) for b, sec in totals.items()}
+
+
 def km_splits(stream: pd.DataFrame, split_m: float = 1000.0) -> pd.DataFrame:
-    """Per-kilometre moving time, pace, heart rate, cadence and elevation change.
+    """Per-kilometre moving time, pace, grade-adjusted pace, heart rate, cadence
+    and elevation change.
 
     The final partial split keeps its own distance, so its pace stays honest;
     a sliver under 100 m is folded into the split before it instead.
+    ``gap_pace_min_per_km`` is NaN when the recording has no altitude.
     """
-    columns = ["split", "distance_m", "time_s", "pace_min_per_km", "avg_hr",
-               "cadence_spm", "elevation_change_m"]
+    columns = ["split", "distance_m", "time_s", "pace_min_per_km", "gap_pace_min_per_km",
+               "avg_hr", "cadence_spm", "elevation_change_m"]
     if len(stream) < 2:
         return pd.DataFrame(columns=columns)
     t, d = _moving(stream)
@@ -454,6 +558,8 @@ def km_splits(stream: pd.DataFrame, split_m: float = 1000.0) -> pd.DataFrame:
     has_alt = ~np.isnan(altitude)
     edge_alt = (np.interp(edges, d[has_alt], altitude[has_alt])
                 if has_alt.sum() >= 2 else np.full(len(edges), np.nan))
+    e = equivalent_distance(stream, d)
+    edge_e = np.interp(edges, d, e) if e is not None else np.full(len(edges), np.nan)
     seconds = _sample_seconds(t)
     rows = []
     for i in range(len(edges) - 1):
@@ -465,12 +571,20 @@ def km_splits(stream: pd.DataFrame, split_m: float = 1000.0) -> pd.DataFrame:
             "distance_m": float(span),
             "time_s": float(duration),
             "pace_min_per_km": float(duration / 60.0 / (span / 1000.0)) if span > 0 else math.nan,
+            "gap_pace_min_per_km": _pace(duration, edge_e[i + 1] - edge_e[i]),
             "avg_hr": _weighted_mean(stream["hr"].to_numpy()[inside], seconds[inside]),
             "cadence_spm": _weighted_mean(stream["cadence_spm"].to_numpy()[inside],
                                           seconds[inside]),
             "elevation_change_m": float(edge_alt[i + 1] - edge_alt[i]),
         })
     return pd.DataFrame(rows, columns=columns)
+
+
+def _pace(seconds: float, metres: float) -> float:
+    """Pace in min/km, NaN for a non-positive or missing distance."""
+    if not np.isfinite(metres) or metres <= 0:
+        return math.nan
+    return float(seconds / 60.0 / (metres / 1000.0))
 
 
 def _weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
@@ -513,7 +627,8 @@ def aerobic_decoupling(stream: pd.DataFrame) -> float:
 
 
 def route_track(stream: pd.DataFrame, points: int = ROUTE_POINTS) -> pd.DataFrame:
-    """A thinned copy of the GPS track: ``DataFrame[lat, lon, distance_m, moving_s, hr]``.
+    """A thinned copy of the GPS track: ``DataFrame[lat, lon, distance_m, moving_s, hr,
+    altitude_m]``.
 
     One sample is kept per equal slice of distance rather than of time, so a
     long stop does not crowd one spot with points and every stretch of the run
@@ -534,6 +649,7 @@ def route_track(stream: pd.DataFrame, points: int = ROUTE_POINTS) -> pd.DataFram
         "distance_m": d[keep] - d[0],
         "moving_s": t[keep] - t[0],
         "hr": stream["hr"].to_numpy()[located][keep],
+        "altitude_m": stream["altitude_m"].to_numpy(dtype="float64")[located][keep],
     }, columns=ROUTE_COLUMNS)
 
 
@@ -542,15 +658,19 @@ def summarize_stream(stream: pd.DataFrame) -> dict:
     best = best_times(stream)
     splits = km_splits(stream)
     mile_splits = km_splits(stream, MILE_M)
+    equivalent = equivalent_distance(stream) if len(stream) >= 2 else None
     route = route_track(stream).round({"lat": 6, "lon": 6, "distance_m": 1, "moving_s": 1,
-                                       "hr": 0})
+                                       "hr": 0, "altitude_m": 1})
     return {
         "duration_s": float(stream["t_s"].iloc[-1]) if len(stream) else 0.0,
         "moving_s": float(_moving(stream)[0][-1]) if len(stream) else 0.0,
         "distance_m": float(stream["distance_m"].iloc[-1] - stream["distance_m"].iloc[0])
         if len(stream) else 0.0,
+        "gap_distance_m": (None if equivalent is None
+                           else round(float(equivalent[-1] - equivalent[0]), 1)),
         "best_s": [None if np.isnan(x) else round(float(x), 2) for x in best],
         "hr_hist": {str(k): round(v, 1) for k, v in hr_histogram(stream).items()},
+        "gap_hist": {str(k): round(v, 1) for k, v in gap_speed_histogram(stream).items()},
         "decoupling_pct": None if np.isnan(dc := aerobic_decoupling(stream)) else round(dc, 2),
         "splits": json.loads(splits.to_json(orient="records")),
         "mile_splits": json.loads(mile_splits.to_json(orient="records")),
@@ -606,7 +726,9 @@ def cache_summary(activity_id: int, path: Path, cache_dir: Path) -> bool:
     """Parse one file and write its summary; returns ``False`` if it failed.
 
     Failures are cached too (with the error message), so a corrupt file is
-    reported once instead of being re-parsed on every page load.
+    reported once instead of being re-parsed on every page load.  An operating
+    system error (a disk or a cloud-synced folder timing out) is *not* cached:
+    the file is fine, so it is simply tried again on the next load.
     """
     try:
         stream = read_stream(path)
@@ -615,6 +737,9 @@ def cache_summary(activity_id: int, path: Path, cache_dir: Path) -> bool:
         record = {"file": path.name, **summarize_stream(stream)}
         ok = True
     except Exception as err:  # noqa: BLE001 - any unreadable file is skipped, not fatal
+        if isinstance(err, OSError) and not isinstance(err, gzip.BadGzipFile):
+            LOGGER.warning("Could not read %s, will retry: %s", path.name, err)
+            return False
         LOGGER.warning("Could not read %s: %s", path.name, err)
         record = {"file": path.name, "error": f"{type(err).__name__}: {err}"}
         ok = False
@@ -650,7 +775,7 @@ def load_stream_data(activities: pd.DataFrame, export_csv: str | Path) -> Stream
     """
     cache_dir = cache_dir_for(export_csv)
     dates = activities.set_index("activity_id")["date"]
-    best_rows, hr_rows, split_frames, mile_frames, run_rows = [], [], [], [], []
+    best_rows, hr_rows, gap_rows, split_frames, mile_frames, run_rows = [], [], [], [], [], []
     status = {"parsed": 0, "failed": 0, "missing": 0}
     for activity_id, path in stream_files(activities, export_csv):
         if not path.is_file():
@@ -668,29 +793,37 @@ def load_stream_data(activities: pd.DataFrame, export_csv: str | Path) -> Stream
                 best_rows.append((activity_id, date, distance, seconds))
         for bpm, seconds in cached["hr_hist"].items():
             hr_rows.append((activity_id, date, int(bpm), seconds))
+        for speed_bin, seconds in cached["gap_hist"].items():
+            gap_rows.append((activity_id, date, int(speed_bin) * SPEED_BIN_M_S, seconds))
         if cached["splits"]:
             split_frames.append(pd.DataFrame(cached["splits"]).assign(activity_id=activity_id))
         if cached["mile_splits"]:
             mile_frames.append(pd.DataFrame(cached["mile_splits"])
                                .assign(activity_id=activity_id))
         run_rows.append((activity_id, cached["duration_s"], cached["moving_s"],
-                         cached["distance_m"], cached["decoupling_pct"],
+                         cached["distance_m"], cached["gap_distance_m"],
+                         cached["decoupling_pct"],
                          bool(cached["hr_hist"])))
 
     best = pd.DataFrame(best_rows, columns=["activity_id", "date", "distance_m", "time_s"])
     hr_seconds = pd.DataFrame(hr_rows, columns=["activity_id", "date", "bpm", "seconds"])
+    gap_seconds = pd.DataFrame(gap_rows, columns=["activity_id", "date", "speed_m_s", "seconds"])
     split_columns = ["activity_id", "split", "distance_m", "time_s", "pace_min_per_km",
-                     "avg_hr", "cadence_spm", "elevation_change_m"]
+                     "gap_pace_min_per_km", "avg_hr", "cadence_spm", "elevation_change_m"]
     splits, mile_splits = (
         pd.concat(frames, ignore_index=True)[split_columns] if frames
         else pd.DataFrame(columns=split_columns)
         for frames in (split_frames, mile_frames))
     runs = pd.DataFrame(run_rows, columns=["activity_id", "duration_s", "moving_s",
-                                           "distance_m", "decoupling_pct", "has_hr"])
-    for frame in (best, hr_seconds):
+                                           "distance_m", "gap_distance_m", "decoupling_pct",
+                                           "has_hr"])
+    for frame in (best, hr_seconds, gap_seconds):
         frame["date"] = pd.to_datetime(frame["date"])
-    runs["decoupling_pct"] = runs["decoupling_pct"].astype("float64")
-    return StreamData(best, hr_seconds, splits, mile_splits, runs, status)
+    for column in ("gap_distance_m", "decoupling_pct"):
+        runs[column] = runs[column].astype("float64")
+    for frame in (splits, mile_splits):
+        frame["gap_pace_min_per_km"] = frame["gap_pace_min_per_km"].astype("float64")
+    return StreamData(best, hr_seconds, gap_seconds, splits, mile_splits, runs, status)
 
 
 def restrict(data: StreamData, activity_ids) -> StreamData:
@@ -698,19 +831,21 @@ def restrict(data: StreamData, activity_ids) -> StreamData:
     ids = set(int(i) for i in activity_ids)
     return data._replace(**{
         name: getattr(data, name)[getattr(data, name)["activity_id"].isin(ids)]
-        for name in ("best", "hr_seconds", "splits", "mile_splits", "runs")
+        for name in ("best", "hr_seconds", "gap_seconds", "splits", "mile_splits", "runs")
     })
 
 
 def route_for(activity_id: int, activities: pd.DataFrame,
               export_csv: str | Path) -> pd.DataFrame:
-    """One run's cached route, with a smoothed pace at every point.
+    """One run's cached route, with a smoothed pace, grade and GAP at every point.
 
     Read on demand rather than with :func:`load_stream_data`, since only the
     run on screen needs its track.  Returns ``DataFrame[lat, lon, distance_m,
-    moving_s, hr, pace_min_per_km]``, empty when the run has no GPS positions.
+    moving_s, hr, altitude_m, pace_min_per_km, grade, gap_pace_min_per_km]``,
+    empty when the run has no GPS positions.  ``grade`` (a fraction) and GAP
+    are NaN when the recording has no altitude.
     """
-    columns = ROUTE_COLUMNS + ["pace_min_per_km"]
+    columns = ROUTE_COLUMNS + ["pace_min_per_km", "grade", "gap_pace_min_per_km"]
     path = dict(stream_files(activities, export_csv)).get(int(activity_id))
     cached = (_read_cache(cache_dir_for(export_csv), activity_id, path)
               if path is not None and path.is_file() else None)
@@ -723,7 +858,35 @@ def route_for(activity_id: int, activities: pd.DataFrame,
     dist = (ahead["distance_m"] - behind["distance_m"]) / 1000.0
     route["pace_min_per_km"] = ((ahead["moving_s"] - behind["moving_s"]) / 60.0
                                 / dist.where(dist > 0))
+    route["grade"] = route_grade(route["distance_m"].to_numpy(), route["altitude_m"].to_numpy())
+    route["gap_pace_min_per_km"] = route["pace_min_per_km"] / grade_cost(route["grade"])
     return route[columns]
+
+
+def route_grade(distance_m: np.ndarray, altitude_m: np.ndarray,
+                window_m: float = GRADE_WINDOW_M * 2) -> np.ndarray:
+    """Grade (rise over run) at each route point, from altitude smoothed over ``window_m``.
+
+    Route points are tens of metres apart, so the window is wider than the one
+    used on the full stream.  All NaN when there is no altitude.
+    """
+    d = np.asarray(distance_m, dtype="float64")
+    a = np.asarray(altitude_m, dtype="float64")
+    valid = ~np.isnan(a)
+    if valid.sum() < 2 or d[-1] - d[0] < GRADE_STEP_M:
+        return np.full(len(d), np.nan)
+    first = np.concatenate([[True], np.diff(d[valid]) > 0])
+    xd, xa = d[valid][first], a[valid][first]
+    if len(xd) < 2:
+        return np.full(len(d), np.nan)
+    grid = np.arange(d[0], d[-1] + GRADE_STEP_M, GRADE_STEP_M)
+    alt = np.interp(grid, xd, xa)
+    width = max(int(round(window_m / GRADE_STEP_M)), 1)
+    if len(alt) > width:
+        padded = np.pad(alt, (width // 2, width - 1 - width // 2), mode="edge")
+        alt = np.convolve(padded, np.ones(width) / width, mode="valid")
+    grade = np.gradient(alt, grid) if len(grid) > 1 else np.zeros(1)
+    return np.clip(np.interp(d, grid, grade), -MAX_GRADE, MAX_GRADE)
 
 
 # --------------------------------------------------------------------------

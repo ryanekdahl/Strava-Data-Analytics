@@ -23,8 +23,8 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has thirteen tabs — Overview, Fitness & Freshness,
-Race plan, Performance, Heart rate, Consistency, All sports, Run detail, Personal models, Gear,
+Python 3.11+. The dashboard has fourteen tabs — Overview, Fitness & Freshness,
+Race plan, Performance, Heart rate, Pace zones, Consistency, All sports, Run detail, Personal models, Gear,
 Sleep & HRV, Head to head and Share — and a sidebar with a switch between the bundled sample data and
 your own export, a
 **period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
@@ -39,11 +39,12 @@ choice between the standard and your fitted Fitness time constants.
 | **Overview** | Total distance, runs, hours and weeks tracked (with the change from the previous period of the same length when a period is picked); current Fitness, Form and ACWR with a plain-English reading of each |
 | **Fitness & Freshness** | CTL / ATL / TSB over time (standard or fitted time constants), the exact load formula behind the curve, and a check of the load score against Strava's own Relative Effort |
 | **Race plan** | Pick a race date and plan your weekly training load — a build-and-taper template you can edit week by week — and see Fitness, Fatigue and Form projected to race day, with a check that race-day Form lands in the race-ready band and that no week ramps Fitness too fast |
-| **Performance** | Pace-vs-distance scatter with the best-effort frontier; true in-run best efforts and a pace curve from the GPS files; the PR table; Riegel race predictions with the standard or your fitted exponent; an interactive race-time calculator; recent form vs all-time best; and 30-day rolling pace and heart-rate trends |
+| **Performance** | Pace-vs-distance scatter with the best-effort frontier; true in-run best efforts and a pace curve from the GPS files; the PR table; Riegel race predictions with the standard or your fitted exponent; an interactive race-time calculator; recent form vs all-time best; and 30-day rolling pace (with grade-adjusted pace) and heart-rate trends |
 | **Heart rate** | Share of time in zones Z1–Z5 — second by second when the GPS files are present, compared against the average-HR shortcut — monthly hours by zone, and each zone's bpm range |
+| **Pace zones** | Share of time in pace zones Z1–Z5, set from your own threshold pace and counted on grade-adjusted pace — second by second when the GPS files are present, compared against the average-pace shortcut — monthly hours by zone, run by run, and each zone's pace range — see `src/pace_zones.py` |
 | **Consistency** | Weekly distance, hours and run counts, monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
 | **All sports** | Rides, swims, walks and gym sessions on the same load scale as runs: weekly hours or load stacked by sport, each sport's share of load and load per hour, and how every session was scored |
-| **Run detail** | Any run's route coloured by pace or heart rate, its per-kilometre (or per-mile) pace, heart rate, cadence and elevation, and its aerobic decoupling |
+| **Run detail** | Any run's route coloured by pace or heart rate; its elevation, pace and heart rate stacked on one distance axis with every climb and descent shaded through all three, plus what the climbs and descents cost in pace, GAP and heart rate; its grade-adjusted pace, its per-kilometre (or per-mile) pace, grade-adjusted pace, heart rate, cadence and elevation, and its aerobic decoupling |
 | **Personal models** | Your own Riegel exponent with a 95% interval, and Banister fitness–fatigue time constants fitted to your runs, with a bootstrap interval, the fit surface, and what one hard session does day by day |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 | **Sleep & HRV** | Import a sleep-score / HRV CSV (Whoop, Oura, Garmin or the template) and see how each morning's reading correlates with the previous day's load, Fatigue and Form — see `src/recovery.py` |
@@ -192,6 +193,36 @@ result from 400 m to the marathon.
 whole-number heart rate, so zones can be redrawn for any resting and max heart rate
 without re-reading a file. The Heart rate tab shows the result next to the
 average-HR shortcut for the same runs.
+
+**Grade-adjusted pace.** Each stretch of a run is credited with an *equivalent flat
+distance*, `distance × cost(grade)`, where
+
+```
+cost(g) = 1 + 2.4 g + 12 g²        (g clipped to ±30%)
+```
+
+This follows the shape Strava describes for its own model: cheapest, about 12% below
+flat, near a −10% grade; back to flat cost near −20%, where descending needs braking;
+and 36% dearer at +10%. The constants approximate that curve and are not Strava's, so
+a run's whole-run GAP comes from the export's `Grade Adjusted Distance` where it
+exists, and the stream estimate is used only for splits, for time in pace zone, and
+for runs whose export row has no GAP. Grade is read from altitude resampled every
+10 m and smoothed over 50 m, so GPS altitude noise does not turn into steep ramps.
+Each run also stores a histogram of moving seconds at every grade-adjusted speed
+(0.1 m/s bins, speed read over a 30-second window), so pace zones can be redrawn
+for any threshold without re-reading a file. Without altitude, GAP is left blank
+and pace zones fall back to plain speed.
+
+**Climbs and descents — `src/terrain.py`.** The cached route keeps altitude too, and
+the run is cut at the turning points of its smoothed elevation profile. A climb starts
+once the road has risen 5 m above the lowest point so far, and ends once it has
+dropped 5 m below the highest, so GPS altitude noise never splits a hill. Flat
+shoulders are trimmed off each end. For every climb, descent and flat stretch the app
+reports distance, pace, GAP, time-weighted heart rate, and heart-rate change. Heart
+rate is read 30 s after the stretch starts and ends, because it lags effort. The
+chart stacks elevation, pace and heart rate as three panels on a shared distance
+axis, never two scales on one plot, and shades each climb and descent through all
+three.
 
 **Splits and aerobic decoupling.** Per-kilometre moving time, pace, heart rate,
 cadence and elevation change, plus Friel's Pa:Hr decoupling — the percentage drop in
@@ -350,6 +381,26 @@ because `activities.csv` carries no second-by-second heart-rate stream. Shares
 are fractions of time on runs that recorded heart rate, so a forgotten strap is
 left out rather than counted as easy running.
 
+### Pace zones — `src/pace_zones.py`
+
+Zones are fractions of **threshold speed**. The threshold is the same one that scores
+training load (the fastest tenth of runs of 5 km or more, on GAP), so a zone is a band
+of the intensity factor `IF = threshold_pace / pace`:
+
+| Zone | Name | % of threshold speed |
+|---|---|---|
+| Z1 | Recovery | below 78% |
+| Z2 | Endurance | 78–88% |
+| Z3 | Tempo | 88–95% |
+| Z4 | Threshold | 95–103% |
+| Z5 | VO2 max | 103% and above |
+
+Pace is grade-adjusted wherever possible, so a slow climb is not counted as an easy
+run. Without GPS files each run's moving time goes to the zone of its average pace;
+with them, every second goes to the zone of its own grade-adjusted speed. Strava uses
+six pace zones. These five match the five heart-rate zones, so the two tabs can be
+read side by side.
+
 ### Consistency and workload — `src/consistency.py`
 
 Weekly and monthly volume are calendar aggregates, zero-filled so that time off
@@ -463,7 +514,9 @@ exercised by the sample rather than bypassed.
 │   ├── consistency.py          # volume, streaks, ACWR
 │   ├── race_calculator.py      # parse a typed time, Riegel at any exponent
 │   ├── heart_rate.py           # HR-reserve zones, time in zone (average HR or streams)
-│   ├── streams.py              # GPX/TCX/FIT parsing, in-run bests, splits, cache
+│   ├── pace_zones.py           # threshold-pace zones on grade-adjusted pace
+│   ├── terrain.py              # climbs / descents and what they cost in pace and HR
+│   ├── streams.py              # GPX/TCX/FIT parsing, in-run bests, splits, GAP, cache
 │   ├── personal_models.py      # personal Riegel exponent, fitted Banister model
 │   ├── sports.py               # rides, swims, gym... scored on the runs' load axis
 │   ├── gear.py                 # shoe mileage and retirement

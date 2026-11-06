@@ -109,6 +109,38 @@ def test_km_splits_cover_the_run_and_keep_the_partial_last_split():
     assert (splits["elevation_change_m"] > 0).all()
 
 
+def test_grade_cost_shape():
+    cost = streams.grade_cost([-0.5, -0.2, -0.1, 0.0, 0.1])
+    np.testing.assert_allclose(cost, [streams.grade_cost(-0.3), 1.0, 0.88, 1.0, 1.36])
+
+
+def test_gap_equals_pace_on_the_flat_and_beats_it_uphill():
+    t = np.arange(0, 1001, 1.0)
+    flat = streams.km_splits(make_stream(t, t * 4.0, altitude=0.0))
+    np.testing.assert_allclose(flat["gap_pace_min_per_km"], flat["pace_min_per_km"])
+    climb = streams.km_splits(make_stream(t, t * 4.0, altitude=t * 4.0 * 0.05))
+    # Steady 5% climb: cost 1 + 0.12 + 0.03 = 1.15, so GAP is pace / 1.15.
+    np.testing.assert_allclose(climb["gap_pace_min_per_km"].iloc[1:-1],
+                               climb["pace_min_per_km"].iloc[1:-1] / 1.15, rtol=1e-3)
+
+
+def test_gap_is_missing_without_altitude():
+    t = np.arange(0, 1001, 1.0)
+    run = make_stream(t, t * 4.0, altitude=np.nan)
+    assert streams.km_splits(run)["gap_pace_min_per_km"].isna().all()
+    assert streams.equivalent_distance(run) is None
+
+
+def test_gap_speed_histogram_sums_to_moving_time_and_reads_climbs_as_faster():
+    t = np.arange(0, 2001, 1.0)
+    flat = streams.gap_speed_histogram(make_stream(t, t * 4.0))
+    assert flat == {40: pytest.approx(2000.0)}
+    climb = streams.gap_speed_histogram(make_stream(t, t * 4.0, altitude=t * 4.0 * 0.05))
+    assert sum(climb.values()) == pytest.approx(2000.0)
+    modal = max(climb, key=climb.get)
+    assert modal * streams.SPEED_BIN_M_S == pytest.approx(4.6, abs=0.05)
+
+
 def test_aerobic_decoupling_measures_heart_rate_drift():
     run = steady(seconds=3600)
     assert streams.aerobic_decoupling(run) == pytest.approx(0.0)
@@ -253,6 +285,16 @@ def test_sample_recordings_parse_and_agree_with_the_csv(sample):
     assert (merged["moving_s"] - merged["moving_time_s"]).abs().max() < 60.0
 
 
+def test_sample_recordings_carry_grade_adjusted_data(sample):
+    path, runs = sample
+    data = streams.load_stream_data(runs, path)
+    assert data.splits["gap_pace_min_per_km"].notna().all()
+    assert data.runs["gap_distance_m"].notna().all()
+    per_run = data.gap_seconds.groupby("activity_id")["seconds"].sum()
+    moving = data.runs.set_index("activity_id")["moving_s"]
+    assert ((per_run - moving.loc[per_run.index]).abs() < 30.0).all()
+
+
 def test_in_run_bests_are_never_slower_than_whole_run_bests(sample):
     path, runs = sample
     data = streams.load_stream_data(runs, path)
@@ -270,6 +312,18 @@ def test_cache_is_reused_then_refreshed_when_a_file_changes(sample):
     first.write_bytes(first.read_bytes())  # same content, new modification time
     pending = streams.pending_files(runs, path)
     assert [file for _, file in pending] == [first]
+
+
+def test_a_disk_error_is_retried_not_cached_as_a_bad_file(tmp_path, monkeypatch):
+    source = tmp_path / "1.gpx"
+    source.write_text("<gpx/>")
+
+    def timeout(path):
+        raise TimeoutError(60, "Operation timed out")
+
+    monkeypatch.setattr(streams, "read_stream", timeout)
+    assert streams.cache_summary(1, source, tmp_path / "cache") is False
+    assert not list((tmp_path / "cache").glob("*.json")) if (tmp_path / "cache").exists() else True
 
 
 def test_unreadable_and_missing_files_are_counted_not_fatal(tmp_path):
@@ -338,6 +392,8 @@ def test_route_for_reads_the_cached_track_with_a_plausible_pace(sample):
     assert route[["lat", "lon"]].notna().all().all()
     # The median point pace sits near the run's average pace.
     assert route["pace_min_per_km"].median() == pytest.approx(run["pace_min_per_km"], rel=0.15)
+    assert route["altitude_m"].notna().all() and route["grade"].abs().max() < 0.1
+    assert route["gap_pace_min_per_km"].notna().all()
     assert streams.route_for(-1, runs, path).empty
 
 
