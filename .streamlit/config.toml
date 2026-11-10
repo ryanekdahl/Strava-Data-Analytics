@@ -6,5 +6,10 @@ backgroundColor = "#fcfcfb"
 secondaryBackgroundColor = "#f0efec"
 textColor = "#0b0b0b"
 
+[server]
+# A full Strava archive can run to hundreds of MB (it includes photos); the app
+# only keeps activities.csv and the GPS files from it.
+maxUploadSize = 1000
+
 [browser]
 gatherUsageStats = false

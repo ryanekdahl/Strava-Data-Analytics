@@ -26,7 +26,7 @@ streamlit run app.py                 # dashboard opens on synthetic data
 Python 3.11+. The dashboard has fourteen tabs — Overview, Fitness & Freshness,
 Race plan, Performance, Heart rate, Pace zones, Consistency, All sports, Run detail, Personal models, Gear,
 Sleep & HRV, Head to head and Share — and a sidebar with a switch between the bundled sample data and
-your own export, a
+your own export (uploaded as Strava's zip, or found in `data/raw/`), a
 **period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
 custom range), **kilometres or miles**, your resting and max heart rate, whether rides, swims and
 other sports count toward Fitness (plus a cycling FTP when rides carry power), and a
@@ -430,6 +430,16 @@ lets you read your own trend rather than issuing a verdict.
 1. Go to **Strava.com → Settings → My Account → Download or Delete Your Account**.
 2. Choose **Request Your Archive**. Strava emails a download link, usually within
    a few hours.
+3. Upload the zip, as it is, in the sidebar's **Your data** box. The app unpacks
+   only `activities.csv` and the `activities/` folder of GPS files, into a private
+   temporary folder for your browser session; photos, messages and the rest of the
+   archive are never written to disk. **Remove my data** deletes it at once, and any
+   folder left behind is purged after six hours. Uploads are capped at 1 GB
+   (`.streamlit/config.toml`); if your archive is bigger because of photos, zip just
+   `activities.csv` and `activities/` and upload that.
+
+When running locally you can skip the upload instead:
+
 3. Unzip the archive and copy `activities.csv` into `data/raw/`. Copy the
    archive's `activities/` folder of GPS recordings into `data/raw/` as well, so
    that `data/raw/activities/` sits next to the CSV. It is optional, but it is what
@@ -438,8 +448,9 @@ lets you read your own trend rather than issuing a verdict.
    selects it by default. The first load reads every GPS file once, with a progress
    bar; after that they come from the cache.
 
-Nothing leaves your machine: the app reads the export from disk and there is no
-network call anywhere in the codebase. The one exception is opt-in — the Run detail
+Run locally, nothing leaves your machine: the app reads the export from disk and there
+is no network call anywhere in the codebase. On a hosted copy, the upload goes to that
+server and stays in the session's temporary folder as described above. The one exception is opt-in — the Run detail
 tab's **Street map** switch, which has your browser load map tiles from CARTO. `.fit` files are decoded with `fitdecode`;
 GPX and TCX need nothing beyond the standard library.
 
@@ -451,6 +462,15 @@ seconds or as `H:MM:SS`, strips thousands separators, coerces everything else wi
 distance or moving time — logging how many it dropped. The synthetic sample is
 written in the same format and read through the same code path, so the loader is
 exercised by the sample rather than bypassed.
+
+## Hosting it
+
+The app deploys as-is to [Streamlit Community Cloud](https://share.streamlit.io)
+(free): **New app → this repository → branch `main` → `app.py`**, and pick Python
+3.11 or later under *Advanced settings*. The sample data is generated on the first
+visit, so the first load takes a little longer. Visitors land on the demo data and
+upload their own archive from the sidebar; each visitor's upload and friends live
+in their own session folder, so nobody sees anyone else's data.
 
 ## Limitations
 
@@ -522,14 +542,17 @@ exercised by the sample rather than bypassed.
 │   ├── gear.py                 # shoe mileage and retirement
 │   ├── units.py                # kilometres / miles display conversion
 │   ├── recovery.py             # sleep / HRV import and correlations
+│   ├── upload.py               # uploaded archives -> private per-session temp folder
 │   └── plots.py                # plotly figure builders
 └── tests/                      # pytest: loader contract, load model, predictions, workload
 ```
 
 ### Head to head — `src/head_to_head.py`
 
-Each friend is one more `activities.csv`, uploaded on the tab (or dropped into
-`data/raw/friends/` as `<name>.csv` or `<name>/activities.csv`) and removable there too. It goes through the
+Each friend is one more `activities.csv` (or their whole archive zip), uploaded on the
+tab (or, locally, dropped into `data/raw/friends/` as `<name>.csv` or
+`<name>/activities.csv`) and removable there too. With an uploaded export, friends
+are kept in the same session folder and deleted with it. It goes through the
 same loader and load model as yours. Everyone is measured over the sidebar's period,
 so a longer export does not win on history alone, and per-week rates sit beside the
 totals. Fitness is computed on each whole history and then cut, with the standard

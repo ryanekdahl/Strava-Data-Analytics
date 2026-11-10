@@ -79,7 +79,7 @@ import json
 import logging
 import math
 import xml.etree.ElementTree as ET
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, NamedTuple
 
 import numpy as np
@@ -706,13 +706,22 @@ def _read_cache(cache_dir: Path, activity_id: int, source: Path) -> dict | None:
 
 
 def stream_files(activities: pd.DataFrame, export_csv: str | Path) -> list[tuple[int, Path]]:
-    """``(activity_id, path)`` for every run whose ``filename`` points at a file."""
+    """``(activity_id, path)`` for every run whose ``filename`` points at a file.
+
+    Names that are absolute or climb out of the export's folder with ``..`` are
+    skipped, so an uploaded CSV can only ever point at files inside its own export.
+    """
     if "filename" not in activities:
         return []
     root = Path(export_csv).parent
     named = activities.dropna(subset=["filename"])
-    return [(int(aid), root / str(name))
-            for aid, name in zip(named["activity_id"], named["filename"])]
+    found = []
+    for aid, name in zip(named["activity_id"], named["filename"]):
+        relative = PurePosixPath(str(name).replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        found.append((int(aid), root / relative))
+    return found
 
 
 def pending_files(activities: pd.DataFrame, export_csv: str | Path) -> list[tuple[int, Path]]:

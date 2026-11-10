@@ -1,8 +1,10 @@
 """Strava Run Analytics -- Streamlit dashboard.
 
 Run with ``streamlit run app.py``.  The app defaults to the bundled synthetic
-export so it is never empty; drop your own ``activities.csv`` into ``data/raw/``
-and the sidebar offers it as a second source.
+export so it is never empty.  Visitors upload their own Strava archive in the
+sidebar (unpacked into a private per-session temp folder, see ``src/upload.py``);
+when running locally you can instead drop ``activities.csv`` into ``data/raw/``
+and the sidebar offers it as another source.
 
 If the export's ``activities/`` folder of GPS recordings sits next to the CSV,
 the app reads those too (once, then from a cache) for true in-run best efforts,
@@ -23,13 +25,14 @@ Methodology section for the formulas behind Fitness, Form, ACWR and Riegel.
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from src import pace_zones, plots, streams, terrain
+from src import pace_zones, plots, streams, terrain, upload
 from src.consistency import (
     SWEET_SPOT, acwr_status, compute_acwr, monthly_volume, summary_kpis,
     weekly_streaks, weekly_volume,
@@ -48,7 +51,7 @@ from src.heart_rate import (
     hr_coverage, monthly_zone_hours, run_zone_breakdown, stream_monthly_zone_hours,
     stream_run_zone_breakdown, stream_zone_distribution, zone_distribution,
 )
-from src.loader import SAMPLE_CSV, find_real_export, load_activities, load_other_activities
+from src.loader import RAW_DIR, SAMPLE_CSV, find_real_export, load_activities, load_other_activities
 from src.performance import (
     RECENT_WINDOW_DAYS, RIEGEL_EXPONENT, Effort, best_effort_frontier, best_recent_effort,
     format_duration, personal_records, predict_races, recent_vs_all_time,
@@ -89,12 +92,15 @@ MIN_RELATIVE_EFFORT_RUNS = 20
 PERIODS = {"All time": None, "Last 12 months": 365, "Last 6 months": 182,
            "Last 3 months": 91, "Last 4 weeks": 28}
 CUSTOM_PERIOD = "Custom range"
+# Every visitor's upload is its own cache entry, so a hosted app bounds the caches.
+CACHE_TTL = "6h"
+CACHE_ENTRIES = 24
 
 st.set_page_config(page_title="Strava Run Analytics", page_icon=":running_shirt_with_sash:",
                    layout="wide")
 
 
-@st.cache_data(show_spinner="Crunching activities...")
+@st.cache_data(show_spinner="Crunching activities...", ttl=CACHE_TTL, max_entries=CACHE_ENTRIES)
 def build_analytics(path: str, _mtime: float, hr_rest: float, hr_max: float,
                     include_other: bool = True, ftp: float | None = None) -> dict:
     """Run the whole pipeline once per file and setting; ``_mtime`` busts the cache on edit.
@@ -136,7 +142,7 @@ def build_analytics(path: str, _mtime: float, hr_rest: float, hr_max: float,
     }
 
 
-@st.cache_data(show_spinner="Reading GPS summaries...")
+@st.cache_data(show_spinner="Reading GPS summaries...", ttl=CACHE_TTL, max_entries=CACHE_ENTRIES)
 def read_streams(path: str, _mtime: float, _cache_token: int) -> streams.StreamData:
     """Gather the cached per-run summaries; the token changes whenever the cache does."""
     return streams.load_stream_data(load_activities(path), path)
@@ -170,7 +176,8 @@ def other_sports_info(path: str, _mtime: float) -> tuple[int, bool]:
     return len(other), bool(other[["avg_watts", "weighted_watts"]].notna().any().any())
 
 
-@st.cache_data(show_spinner="Crunching a friend's activities...")
+@st.cache_data(show_spinner="Crunching a friend's activities...", ttl=CACHE_TTL,
+               max_entries=4 * CACHE_ENTRIES)
 def build_friend(path: str, _mtime: float, include_other: bool = True) -> dict:
     """A friend's runs and Fitness, scored like yours but with the default heart rates.
 
@@ -201,20 +208,124 @@ def choose_source() -> Path:
         with st.spinner("Generating sample friends..."):
             generate_friends(SAMPLE_CSV)
 
+    uploaded = upload_export()
     sources = {"Sample data (synthetic)": SAMPLE_CSV}
     real_export = find_real_export()
     if real_export is not None:
         sources[f"My export ({real_export.name})"] = real_export
+    if uploaded is not None:
+        sources[UPLOADED_SOURCE] = uploaded
 
-    label = st.sidebar.radio("Data source", list(sources), index=len(sources) - 1)
-    if real_export is None:
-        st.sidebar.info(
-            "Using synthetic data. To analyse your own runs, request your archive "
-            "from Strava (Settings -> My Account -> Download or Delete Your Account) "
-            "and drop `activities.csv` -- and its `activities/` folder of GPS "
-            "files -- into `data/raw/`."
-        )
+    # A fresh upload switches the view to it; otherwise the visitor's pick stands.
+    if st.session_state.pop("switch_to_upload", False):
+        st.session_state["data_source"] = UPLOADED_SOURCE
+    if st.session_state.get("data_source") not in sources:
+        st.session_state["data_source"] = list(sources)[-1]
+    label = st.sidebar.radio("Data source", list(sources), key="data_source")
     return sources[label]
+
+
+UPLOADED_SOURCE = "My uploaded export"
+EXPORT_STEPS = (
+    "1. On strava.com, open **Settings -> My Account**.\n"
+    "2. Under **Download or Delete Your Account**, click **Get Started**, then "
+    "**Request Your Archive**.\n"
+    "3. Strava emails you a link, usually within a few hours. Download the `.zip`.\n"
+    "4. Upload that zip in the sidebar, as it is -- no need to unzip it."
+)
+PRIVACY_NOTE = (
+    "Your export is unpacked into a private temporary folder for your browser session "
+    "only. It is never shared with other visitors, and it is deleted when you click "
+    "**Remove my data** or a few hours after you leave. Only `activities.csv` and the "
+    "GPS files are read; the photos and messages in the archive are skipped."
+)
+
+
+def session_workspace() -> Path:
+    """This browser session's private folder for uploads, created on first use."""
+    workspace = st.session_state.get("workspace")
+    if workspace is None or not Path(workspace).is_dir():
+        upload.purge_old_workspaces()
+        workspace = upload.new_workspace()
+        st.session_state["workspace"] = workspace
+    return Path(workspace)
+
+
+def forget_upload() -> None:
+    """Delete this session's uploaded export and friends, and clear the widgets holding them."""
+    workspace = st.session_state.pop("workspace", None)
+    if workspace is not None:
+        upload.remove_workspace(Path(workspace))
+    for key in ("uploaded_export", "upload_id", "h2h_friends", "h2h_shared_friend"):
+        st.session_state.pop(key, None)
+
+
+def upload_export() -> Path | None:
+    """Sidebar uploader for the visitor's own Strava archive; returns its ``activities.csv``.
+
+    The archive is unpacked once per distinct file; reruns reuse it.
+    """
+    st.sidebar.subheader("Your data")
+    # Streamlit cannot clear a file uploader from code, so "Remove my data" swaps in a new one.
+    generation = st.session_state.setdefault("uploader_generation", 0)
+    file = st.sidebar.file_uploader(
+        "Upload your Strava export", type=["zip", "csv"], key=f"export_upload_{generation}",
+        help="The .zip Strava emails you, unchanged -- or just its activities.csv "
+             "(without GPS files, a few views are less detailed).")
+    with st.sidebar.expander("How to get your export"):
+        st.markdown(EXPORT_STEPS)
+        st.caption(PRIVACY_NOTE)
+
+    if file is None:
+        if st.session_state.get("uploaded_export") is not None:
+            forget_upload()  # the visitor cleared the uploader
+        st.session_state.pop("upload_error", None)
+        return None
+    upload_id = f"{file.file_id}:{file.name}:{file.size}"
+    failed = st.session_state.get("upload_error")
+    if failed is not None and failed[0] == upload_id:
+        st.sidebar.error(failed[1])
+        return None
+    if st.session_state.get("upload_id") != upload_id:
+        return unpack_upload(file, upload_id)
+
+    csv_path = Path(st.session_state["uploaded_export"])
+    if not csv_path.is_file():  # the temporary folder expired while the tab sat open
+        forget_upload()
+        st.session_state["uploader_generation"] += 1
+        st.sidebar.warning("Your uploaded data expired after a long idle spell; "
+                           "please upload it again.")
+        return None
+    os.utime(csv_path.parents[1])  # keep an active session's folder from being purged
+    if st.sidebar.button("Remove my data", key="remove_upload",
+                         help="Deletes your uploaded export and any friends you added, now."):
+        forget_upload()
+        st.session_state["uploader_generation"] += 1
+        st.rerun()
+    return csv_path
+
+
+def unpack_upload(file, upload_id: str) -> None:
+    """Unpack and check a newly uploaded export, then rerun onto it (or record why it failed)."""
+    forget_upload()  # a replaced upload takes its predecessor's friends with it
+    try:
+        with st.spinner(f"Unpacking {file.name}..."):
+            csv_path = upload.extract_export(file, file.name, session_workspace())
+            runs = load_activities(csv_path)
+        problem = None if not runs.empty else (
+            "That export has no runs in it, so there is nothing to analyse yet.")
+    except (upload.ExportError, ValueError, pd.errors.ParserError,
+            UnicodeDecodeError, OSError) as err:
+        problem = f"That file could not be read as a Strava export: {err}"
+    if problem is not None:
+        forget_upload()
+        st.session_state["upload_error"] = (upload_id, problem)
+        st.sidebar.error(problem)
+        return None
+    st.session_state.update(uploaded_export=csv_path, upload_id=upload_id,
+                            switch_to_upload=True)
+    st.session_state.pop("upload_error", None)
+    st.rerun()
 
 
 def choose_units() -> Units:
@@ -1102,7 +1213,8 @@ def recovery_tab(data: dict, is_sample: bool) -> None:
             "Any CSV with a **date** column and a **sleep score** and/or **HRV (ms)** "
             "column works -- names are matched loosely, so exports from Whoop, Oura or "
             "Garmin usually load as-is. Each date is the morning the reading describes. "
-            "To skip uploading every session, save the file as `data/raw/recovery.csv`."
+            "Running the app on your own computer? Save the file as `data/raw/recovery.csv` "
+            "to skip uploading it every session."
         )
         st.download_button("Download a template", TEMPLATE_CSV, "recovery_template.csv",
                            mime="text/csv")
@@ -1705,20 +1817,38 @@ def format_metric(key: str, value: float, units: Units) -> str:
     return f"{value:,.0f}"
 
 
-def add_friend_form() -> None:
-    """Upload a friend's ``activities.csv``, check it reads, and save it to ``data/raw/friends/``."""
+def friends_folder(path: Path) -> tuple[Path, bool]:
+    """Where the friends for the export at ``path`` live, and whether that folder is kept.
+
+    An export in ``data/raw/`` keeps its friends in ``data/raw/friends/`` on this
+    computer; an uploaded export's friends sit in the same private session folder
+    as the upload and go when it does.
+    """
+    if path == SAMPLE_CSV:
+        return SAMPLE_FRIENDS_DIR, True
+    if path.parent == RAW_DIR:
+        return FRIENDS_DIR, True
+    return path.parents[1] / "friends", False
+
+
+def add_friend_form(folder: Path, kept: bool) -> None:
+    """Upload a friend's export (zip or ``activities.csv``), check it reads, and save it to ``folder``."""
     with st.expander("Add a friend"):
+        where = ("It is saved as `data/raw/friends/<name>.csv` and stays on this computer; "
+                 "you can also drop files there yourself." if kept else
+                 "It is kept only for this browser session, alongside your own upload, and "
+                 "deleted with it.")
         st.markdown(
             "Ask a friend to request their archive from Strava (Settings -> My Account -> "
-            "Download or Delete Your Account) and send you its `activities.csv`. It is saved "
-            "as `data/raw/friends/<name>.csv` and stays on this computer; you can also drop "
-            "files there yourself.")
+            f"Download or Delete Your Account) and send you the zip or its `activities.csv`. {where}")
         name = st.text_input("Friend's name", key="friend_name")
-        uploaded = st.file_uploader("Their activities.csv", type="csv", key="friend_upload")
+        uploaded = st.file_uploader("Their export (.zip or activities.csv)", type=["zip", "csv"],
+                                    key="friend_upload")
         if not st.button("Add friend", disabled=not (name.strip() and uploaded)):
             return
         try:
-            path = save_friend_export(uploaded.getvalue(), name.strip())
+            content = upload.read_export_csv(uploaded, uploaded.name)
+            path = save_friend_export(content, name.strip(), folder)
         except ValueError as err:
             st.error(str(err))
             return
@@ -1735,14 +1865,14 @@ def add_friend_form() -> None:
         st.rerun()
 
 
-def remove_friend_form(exports: dict[str, Path]) -> None:
-    """Delete a friend's export from ``data/raw/friends/``."""
+def remove_friend_form(exports: dict[str, Path], folder: Path) -> None:
+    """Delete a friend's export from ``folder``."""
     with st.expander("Remove a friend"):
         name = st.selectbox("Friend", list(exports), key="friend_remove")
         if not st.button(f"Remove {name}", key="friend_remove_button"):
             return
         try:
-            remove_friend_export(exports[name])
+            remove_friend_export(exports[name], folder)
         except (ValueError, OSError) as err:
             st.error(f"Could not remove {name}: {err}")
             return
@@ -1777,15 +1907,16 @@ def head_to_head_tab(data: dict, path: Path, start: pd.Timestamp, end: pd.Timest
     if is_sample:
         st.caption("These friends are synthetic, generated alongside the sample data. With "
                    "your own export selected you can add real friends here.")
-    else:
-        add_friend_form()
+    folder, kept = friends_folder(path)
+    if not is_sample:
+        add_friend_form(folder, kept)
 
-    exports = find_friend_exports(SAMPLE_FRIENDS_DIR if is_sample else FRIENDS_DIR)
+    exports = find_friend_exports(folder)
     if not exports:
         st.info("No friends added yet. Add a friend's `activities.csv` above to compare.")
         return
     if not is_sample:
-        remove_friend_form(exports)
+        remove_friend_form(exports, folder)
     cols = st.columns([1, 3])
     me = cols[0].text_input("Your name", "You", key="h2h_me").strip() or "You"
     chosen = cols[1].multiselect("Compare with", list(exports),
@@ -1961,6 +2092,13 @@ def main() -> None:
         + (f" (of {len(all_activities):,} in the export)."
            if len(activities) < len(all_activities) else ".")
     )
+    if path == SAMPLE_CSV:
+        st.info(
+            "**You are looking at demo data** -- 16 months of a made-up runner's training. "
+            "To see your own, upload your Strava export in the sidebar; it takes about a "
+            "minute to process. Don't have it yet? Open **How to get your export** in the "
+            "sidebar -- Strava usually emails it within a few hours.",
+            icon=":material/waving_hand:")
     all_streams = prepare_streams(path, all_activities)
     if all_streams is not None and all_streams.status["failed"]:
         st.caption(f"{all_streams.status['failed']:,} GPS files could not be read and are "
