@@ -75,7 +75,7 @@ from src.sports import (
 )
 from src.sticker import INKS, png_size, render_sticker
 from src.race_calculator import (
-    CALCULATOR_DISTANCES, EXPONENT_RANGE, calculator_predictions, parse_duration,
+    CALCULATOR_DISTANCES, EXPONENT_RANGE, calculator_predictions, parse_duration, split_times,
 )
 from src.training_load import (
     ATL_DAYS, CTL_DAYS, DEFAULT_HR_MAX, DEFAULT_HR_REST, compute_activity_load,
@@ -879,6 +879,25 @@ def race_calculator(effort, units: Units, exponent: float = RIEGEL_EXPONENT) -> 
         "The exponent is how much pace fades as distance grows: 1.06 is Riegel's "
         "population fit, lower suits endurance-strong runners, higher suits speed-strong ones."
     )
+    split_sheet(table, units)
+
+
+def split_sheet(table: pd.DataFrame, units: Units) -> None:
+    """Even-pace clock times at every kilometre or mile of one predicted race."""
+    with st.expander(f"Even-pace split sheet (per {units.split_label.lower()})"):
+        names = table["distance"].tolist()
+        default = names.index("Half Marathon") if "Half Marathon" in names else len(names) - 1
+        race = st.selectbox("Race", names, index=default, key="split_sheet_race")
+        row = table.set_index("distance").loc[race]
+        sheet = split_times(row["distance_km"], row["predicted_time_s"], units.split_m / 1000.0)
+        st.dataframe(pd.DataFrame({
+            units.split_label: sheet["at_km"].map(
+                lambda km: f"{units.distance(km):.2f}".rstrip("0").rstrip(".")),
+            "Split": sheet["split_time_s"].map(format_duration),
+            "Clock": sheet["elapsed"],
+        }), hide_index=True, width="stretch", height=min(36 * (len(sheet) + 1) + 2, 420))
+        st.caption(f"Goal {row['predicted_time']} for the {race}, run at an even "
+                   f"{units.format_pace(row['predicted_time_s'] / 60.0 / row['distance_km'])}.")
 
 
 def heart_rate_tab(data: dict, stream_data) -> None:

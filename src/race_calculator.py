@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from src.performance import RIEGEL_EXPONENT, Effort, predict_races
+from src.performance import RIEGEL_EXPONENT, Effort, format_duration, predict_races
 
 # Distances the user can enter a result for, and that predictions are made at.
 CALCULATOR_DISTANCES: dict[str, float] = {
@@ -73,3 +73,31 @@ def calculator_predictions(
     input) so the user can sanity-check the pace column against what they ran.
     """
     return predict_races(Effort(distance_km, time_s), distances, exponent)
+
+
+def split_times(distance_km: float, time_s: float, split_km: float = 1.0) -> pd.DataFrame:
+    """Even-pace split sheet: the clock time to hit at every split marker.
+
+    Markers fall every ``split_km`` kilometres (1.0 for kilometres, 1.609344
+    for miles), and the race distance itself is always the last row, so a
+    half marathon in miles ends with a 0.1 mi split.  Returns
+    ``DataFrame[split, at_km, split_time_s, elapsed_s, elapsed]``.
+    """
+    if distance_km <= 0 or time_s <= 0 or split_km <= 0:
+        raise ValueError("distance, time and split length must be positive")
+    pace_s_per_km = time_s / distance_km
+    rows = []
+    marker, number = 0.0, 0
+    while marker < distance_km - 1e-9:
+        number += 1
+        # Snap markers within a metre of the finish to the finish itself.
+        nxt = number * split_km
+        nxt = distance_km if nxt > distance_km - 1e-3 else nxt
+        elapsed = nxt * pace_s_per_km
+        rows.append({
+            "split": number, "at_km": nxt,
+            "split_time_s": (nxt - marker) * pace_s_per_km,
+            "elapsed_s": elapsed, "elapsed": format_duration(elapsed),
+        })
+        marker = nxt
+    return pd.DataFrame(rows)
