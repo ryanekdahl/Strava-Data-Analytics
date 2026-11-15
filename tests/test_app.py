@@ -154,3 +154,13 @@ def test_pace_zones_tab_and_grade_adjusted_pace(app):
 def test_run_detail_lines_up_hills_with_pace_and_heart_rate(app):
     assert any(h.value.startswith("Hills") for h in app.subheader)
     assert any("On the climbs you ran" in m.value for m in app.markdown)
+
+
+def test_run_detail_search_narrows_the_run_list(app):
+    picker = app.selectbox(key="detail_run")
+    assert picker.label.endswith(" runs)")
+    app.text_input(key="detail_run_query").set_value("zzz-no-such-run").run()
+    _assert_clean(app)
+    assert any("No runs match" in i.value for i in app.info)
+    app.text_input(key="detail_run_query").set_value("").run()
+    _assert_clean(app)

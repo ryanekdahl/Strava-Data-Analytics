@@ -28,6 +28,7 @@ import base64
 import os
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -74,6 +75,7 @@ from src.sports import (
     weekly_sport_hours,
 )
 from src.sticker import INKS, png_size, render_sticker
+from src.run_search import filter_runs
 from src.race_calculator import (
     CALCULATOR_DISTANCES, EXPONENT_RANGE, calculator_predictions, parse_duration, split_times,
 )
@@ -884,7 +886,7 @@ def race_calculator(effort, units: Units, exponent: float = RIEGEL_EXPONENT) -> 
 
 def split_sheet(table: pd.DataFrame, units: Units) -> None:
     """Even-pace clock times at every kilometre or mile of one predicted race."""
-    with st.expander(f"Even-pace split sheet (per {units.split_label.lower()})"):
+    with st.expander(f"Even-pace split sheet (per {units.split_label.lower()})", expanded=True):
         names = table["distance"].tolist()
         default = names.index("Half Marathon") if "Half Marathon" in names else len(names) - 1
         race = st.selectbox("Race", names, index=default, key="split_sheet_race")
@@ -1333,6 +1335,36 @@ NO_STREAMS_HELP = (
 )
 
 
+def pick_run(runs: pd.DataFrame, units: Units, key: str) -> int | None:
+    """A run picker narrowed by words in the title and a distance range.
+
+    ``runs`` should already be in display order.  Returns the chosen
+    activity id, or ``None`` (after saying so) when nothing matches.
+    """
+    cols = st.columns([3, 2])
+    query = cols[0].text_input("Search titles", key=f"{key}_query",
+                               placeholder="e.g. long run, tempo, parkrun")
+    shown = units.distance(runs["distance_km"])
+    lo, hi = float(np.floor(shown.min())), float(np.ceil(shown.max()))
+    min_km = max_km = None
+    if hi > lo:
+        # Bounds in the key so a new period or unit system starts a fresh slider.
+        low, high = cols[1].slider(f"Distance ({units.distance_label})", lo, hi, (lo, hi),
+                                   step=0.5, key=f"{key}_distance_{units.distance_label}_{lo}_{hi}")
+        if (low, high) != (lo, hi):
+            min_km, max_km = low / units.per_km - 1e-9, high / units.per_km + 1e-9
+    found = filter_runs(runs, query, min_km, max_km)
+    if found.empty:
+        st.info("No runs match that search. Try fewer words or a wider distance range.")
+        return None
+    labels = {int(row.activity_id): f"{row.date:%a %d %b %Y} -- {row.name} -- "
+                                    f"{units.format_distance(row.distance_km)}"
+              for row in found.itertuples()}
+    count = (f"{len(found)} of {len(runs)} runs" if len(found) < len(runs)
+             else f"{len(runs)} runs")
+    return st.selectbox(f"Run ({count})", list(labels), format_func=labels.get, key=key)
+
+
 def run_detail_tab(data: dict, stream_data, path: Path) -> None:
     activities, units = data["activities"], data["units"]
     if stream_data is None or stream_data.splits.empty:
@@ -1342,10 +1374,9 @@ def run_detail_tab(data: dict, stream_data, path: Path) -> None:
     all_splits = stream_data.mile_splits if units is IMPERIAL else stream_data.splits
     with_splits = activities[activities["activity_id"].isin(stream_data.splits["activity_id"])]
     runs = with_splits.sort_values("date", ascending=False)
-    labels = {int(row.activity_id): f"{row.date:%a %d %b %Y} -- {row.name} -- "
-                                    f"{units.format_distance(row.distance_km)}"
-              for row in runs.itertuples()}
-    activity_id = st.selectbox("Run", list(labels), format_func=labels.get)
+    activity_id = pick_run(runs, units, "detail_run")
+    if activity_id is None:
+        return
     run = runs.set_index("activity_id").loc[activity_id]
     splits = all_splits[all_splits["activity_id"] == activity_id]
     detail = stream_data.runs.set_index("activity_id").loc[activity_id]
@@ -1771,11 +1802,9 @@ def share_tab(data: dict, stream_data, path: Path) -> None:
     route = None
     if kind == "One run":
         runs = activities.sort_values("date", ascending=False)
-        labels = {int(row.activity_id): f"{row.date:%a %d %b %Y} -- {row.name} -- "
-                                        f"{units.format_distance(row.distance_km)}"
-                  for row in runs.itertuples()}
-        activity_id = st.selectbox("Run", list(labels), format_func=labels.get,
-                                   key="sticker_run")
+        activity_id = pick_run(runs, units, "sticker_run")
+        if activity_id is None:
+            return
         run = runs.set_index("activity_id").loc[activity_id]
         available = run_sticker_stats(run, units)
         default = ["Distance", "Pace", "Time"]
