@@ -23,33 +23,24 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has fourteen tabs — Overview, Fitness & Freshness,
-Race plan, Performance, Heart rate, Pace zones, Consistency, All sports, Run detail, Personal models, Gear,
-Sleep & HRV, Head to head and Share — and a sidebar with a switch between the bundled sample data and
-your own export (uploaded as Strava's zip, or found in `data/raw/`), a
-**period** (all time, the last 12 / 6 / 3 months or 4 weeks, a calendar year, or a
-custom range), **kilometres or miles**, your resting and max heart rate, whether rides, swims and
-other sports count toward Fitness (plus a cycling FTP when rides carry power), and a
-choice between the standard and your fitted Fitness time constants.
+Python 3.11+. The dashboard has six tabs, covering the stats Strava itself shows plus
+a Fitness & Freshness tab with workload management for serious runners: Overview,
+Activities, Best efforts, Fitness & Freshness, Heart rate and Gear. The sidebar has a
+switch between the bundled sample data and your own export (uploaded as Strava's zip,
+or found in `data/raw/`), a **period** (all time, the last 12 / 6 / 3 months or 4 weeks,
+a calendar year, or a custom range), **kilometres or miles**, and your resting and max
+heart rate.
 
 ## What it computes
 
 | Tab | What you get |
 |---|---|
-| **Overview** | Total distance, runs, hours and weeks tracked (with the change from the previous period of the same length when a period is picked); current Fitness, Form and ACWR with a plain-English reading of each |
-| **Fitness & Freshness** | CTL / ATL / TSB over time (standard or fitted time constants), the exact load formula behind the curve, and a check of the load score against Strava's own Relative Effort |
-| **Race plan** | Pick a race date and plan your weekly training load — a build-and-taper template you can edit week by week — and see Fitness, Fatigue and Form projected to race day, with a check that race-day Form lands in the race-ready band and that no week ramps Fitness too fast |
-| **Performance** | Pace-vs-distance scatter with the best-effort frontier; true in-run best efforts and a pace curve from the GPS files; the PR table; Riegel race predictions with the standard or your fitted exponent; an interactive race-time calculator with an even-pace split sheet (clock time at every km or mile); recent form vs all-time best; and 30-day rolling pace (with grade-adjusted pace) and heart-rate trends |
-| **Heart rate** | Share of time in zones Z1–Z5 — second by second when the GPS files are present, compared against the average-HR shortcut — monthly hours by zone, and each zone's bpm range |
-| **Pace zones** | Share of time in pace zones Z1–Z5, set from your own threshold pace and counted on grade-adjusted pace — second by second when the GPS files are present, compared against the average-pace shortcut — monthly hours by zone, run by run, and each zone's pace range — see `src/pace_zones.py` |
-| **Consistency** | Weekly distance, hours and run counts, monthly volume, current and longest weekly streak, and the acute:chronic workload ratio against its sweet-spot band |
-| **All sports** | Rides, swims, walks and gym sessions on the same load scale as runs: weekly hours or load stacked by sport, each sport's share of load and load per hour, and how every session was scored |
-| **Run detail** | Any run — found by searching titles or narrowing by distance — with its route coloured by pace or heart rate; its elevation, pace and heart rate stacked on one distance axis with every climb and descent shaded through all three, plus what the climbs and descents cost in pace, GAP and heart rate; its grade-adjusted pace, its per-kilometre (or per-mile) pace, grade-adjusted pace, heart rate, cadence and elevation, and its aerobic decoupling |
-| **Personal models** | Your own Riegel exponent with a 95% interval, and Banister fitness–fatigue time constants fitted to your runs, with a bootstrap interval, the fit surface, and what one hard session does day by day |
+| **Overview** | Total distance, runs, moving time and elevation gain (with the change from the previous period of the same length when a period is picked); current and longest weekly streak, typical and biggest week; weekly and monthly distance |
+| **Activities** | Any run, found by searching titles or narrowing by distance, with its route coloured by pace or heart rate; distance, time, pace, grade-adjusted pace, heart rate and cadence; its elevation, pace and heart rate stacked on one distance axis with climbs and descents shaded; per-kilometre (or per-mile) splits |
+| **Best efforts** | True in-run best efforts from the GPS files (or whole-run PRs without them), Riegel race predictions from current form, and a race-time calculator |
+| **Fitness & Freshness** | Fitness, Fatigue and Form (CTL / ATL / TSB) over time with today's reading, the acute:chronic workload ratio against its sweet-spot band, and the exact load formula behind both. Rides, swims and other sessions count toward the load |
+| **Heart rate** | Share of time in zones Z1–Z5 (second by second when the GPS files are present), monthly hours by zone, and each zone's bpm range |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
-| **Sleep & HRV** | Import a sleep-score / HRV CSV (Whoop, Oura, Garmin or the template) and see how each morning's reading correlates with the previous day's load, Fatigue and Form — see `src/recovery.py` |
-| **Head to head** | Add friends' Strava exports and compare over the same period: a scoreboard of up to ten categories you pick (distance, runs, time, elevation, longest run, distance per week, consistency, streak, pace, Fitness), a cumulative race and weekly battles on distance, time, elevation or runs, Fitness side by side, best efforts and race predictions, and the runs you did together with who was faster — see `src/head_to_head.py` |
-| **Share** | A Strava-style sticker for an Instagram story: the period's or one run's headline stats (and the route) on a transparent PNG, copied to the clipboard or downloaded — see `src/sticker.py` |
 
 ## Methodology
 

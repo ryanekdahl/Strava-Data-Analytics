@@ -13,7 +13,6 @@ import pytest
 pytest.importorskip("streamlit.testing.v1")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-from src.head_to_head import METRICS  # noqa: E402
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
 TIMEOUT_S = 600
@@ -68,86 +67,32 @@ def test_route_map_with_and_without_street_tiles(app):
     _assert_clean(app)
 
 
-def test_other_sports_tab_and_toggle(app):
-    assert any(tab.label == "All sports" for tab in app.tabs)
-    with_other = next(m for m in app.metric if m.label == "Fitness (CTL)").value
-    app.toggle(key="include_other").set_value(False).run()
-    _assert_clean(app)
-    runs_only = next(m for m in app.metric if m.label == "Fitness (CTL)").value
-    assert float(runs_only) < float(with_other)
-    app.toggle(key="include_other").set_value(True).run()
-    app.number_input(key="ftp").set_value(240).run()
-    app.radio(key="sport_stack").set_value("Training load").run()
-    _assert_clean(app)
-    app.number_input(key="ftp").set_value(0).run()
+def test_six_tabs(app):
+    assert [tab.label for tab in app.tabs] == [
+        "Overview", "Activities", "Best efforts", "Fitness & Freshness", "Heart rate", "Gear"]
 
 
-def test_share_tab_makes_period_and_run_stickers(app):
-    assert any(tab.label == "Share" for tab in app.tabs)
-    app.multiselect(key="sticker_stats_This period").set_value(["Distance", "Fitness"]).run()
-    _assert_clean(app)
-    app.radio(key="sticker_kind").set_value("One run").run()
-    _assert_clean(app)
-    app.radio(key="sticker_ink").set_value("Black").run()
-    _assert_clean(app)
-    app.radio(key="sticker_kind").set_value("This period").run()
+def test_fitness_tab_shows_load_and_workload_ratio(app):
+    labels = {m.label for m in app.metric}
+    assert {"Fitness (CTL)", "Fatigue (ATL)", "Form (TSB)", "ACWR"} <= labels
 
 
-def test_race_plan_tab_projects_to_race_day(app):
-    assert any(tab.label == "Race plan" for tab in app.tabs)
-    assert any(m.label == "Race-day Form" for m in app.metric)
-    app.selectbox(key="plan_taper").set_value(0).run()
+def test_best_efforts_and_race_calculator(app):
+    assert any(h.value == "Best efforts" for h in app.subheader)
+    assert any(h.value == "Race predictions" for h in app.subheader)
+    good = app.text_input(key="calc_time").value
+    app.text_input(key="calc_time").set_value("not a time").run()
     _assert_clean(app)
-    untapered = float(next(m for m in app.metric if m.label == "Race-day Form").value)
-    app.selectbox(key="plan_taper").set_value(3).run()
-    _assert_clean(app)
-    tapered = float(next(m for m in app.metric if m.label == "Race-day Form").value)
-    assert tapered > untapered
-    app.radio(key="time_constants").set_value("Fitted to my data").run()
-    _assert_clean(app)
-    app.radio(key="time_constants").set_value(app.radio(key="time_constants").options[0]).run()
-    app.selectbox(key="plan_taper").set_value(2).run()
+    assert app.warning
+    app.text_input(key="calc_time").set_value(good).run()
 
 
-def test_head_to_head_tab_compares_sample_friends(app):
-    assert any(tab.label == "Head to head" for tab in app.tabs)
-    assert any(m.label == "Runs together" for m in app.metric)
-    app.multiselect(key="h2h_friends").set_value(["Sam"]).run()
-    _assert_clean(app)
-    assert {"You", "Sam"} <= {m.label for m in app.metric}
-    app.text_input(key="h2h_me").set_value("Ryan").run()
-    app.selectbox(key="period").set_value("Last 4 weeks").run()
-    _assert_clean(app)
-    app.selectbox(key="period").set_value("All time").run()
-    app.text_input(key="h2h_me").set_value("You").run()
-    app.multiselect(key="h2h_friends").set_value(["Alex", "Sam"]).run()
-    app.selectbox(key="h2h_shared_friend").set_value("Sam").run()
-    _assert_clean(app)
-    for measure in ("hours", "elevation_m", "runs", "distance_km"):
-        app.radio(key="h2h_measure").set_value(measure).run()
-        _assert_clean(app)
-    app.multiselect(key="h2h_categories").set_value(["distance_km", "runs"]).run()
-    _assert_clean(app)
-    assert any(m.value.endswith("of 2") for m in app.metric)
-    app.multiselect(key="h2h_categories").set_value([]).run()
-    _assert_clean(app)
-    app.multiselect(key="h2h_categories").set_value([key for key, _, _ in METRICS]).run()
-    app.slider(key="h2h_window").set_value(1).run()
-    app.slider(key="h2h_tolerance").set_value(5).run()
-    _assert_clean(app)
-    app.slider(key="h2h_window").set_value(15).run()
-    app.slider(key="h2h_tolerance").set_value(15).run()
-
-
-def test_pace_zones_tab_and_grade_adjusted_pace(app):
-    assert any(tab.label == "Pace zones" for tab in app.tabs)
-    threshold = next(m for m in app.metric if m.label == "Threshold pace")
-    assert threshold.value.endswith("/km")
+def test_run_detail_grade_adjusted_pace(app):
     gap = next(m for m in app.metric if m.label == "Grade-adjusted pace")
     assert gap.value != "--"
     app.radio(key="units").set_value("Miles").run()
     _assert_clean(app)
-    assert next(m for m in app.metric if m.label == "Threshold pace").value.endswith("/mi")
+    assert next(m for m in app.metric if m.label == "Grade-adjusted pace").value.endswith("/mi")
     app.radio(key="units").set_value("Kilometres").run()
 
 

@@ -1,4 +1,4 @@
-"""The hosted flow: a visitor uploads their archive, adds a friend, then removes it all.
+"""The hosted flow: a visitor uploads their archive, then removes it.
 
 Drives ``app.py`` through Streamlit's ``AppTest`` with a zip built from the
 sample export (its CSV plus a few GPS files, to keep the run quick).
@@ -16,7 +16,7 @@ import pytest
 pytest.importorskip("streamlit.testing.v1")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-from src.generate_sample import generate_friends, generate_sample, sample_is_current  # noqa: E402
+from src.generate_sample import generate_sample, sample_is_current  # noqa: E402
 from src.loader import SAMPLE_CSV  # noqa: E402
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
@@ -28,7 +28,6 @@ GPS_FILES = 5
 def archive() -> bytes:
     if not sample_is_current() or not (SAMPLE_CSV.parent / "activities").is_dir():
         generate_sample(SAMPLE_CSV)
-        generate_friends(SAMPLE_CSV)
     runs = pd.read_csv(SAMPLE_CSV)
     with_gps = runs["Filename"].dropna().head(GPS_FILES)
     buffer = io.BytesIO()
@@ -48,7 +47,7 @@ def _assert_clean(at: AppTest) -> None:
     assert not at.exception, [e.message for e in at.exception]
 
 
-def test_upload_add_friend_and_remove(archive):
+def test_upload_and_remove(archive):
     at = AppTest.from_file(str(APP), default_timeout=TIMEOUT_S)
     at.run()
     _assert_clean(at)
@@ -64,16 +63,6 @@ def test_upload_add_friend_and_remove(archive):
     assert (export / "activities.csv").is_file()
     assert len(list((export / "activities").iterdir())) == GPS_FILES
     assert not (export / "media").exists()
-
-    friend = (SAMPLE_CSV.parent / "friends" / "sam.csv").read_bytes()
-    at.text_input(key="friend_name").set_value("Jo")
-    _uploader(at, "friend_upload").set_value(("activities.csv", friend, "text/csv"))
-    at.run()
-    next(b for b in at.button if b.label == "Add friend").click()
-    at.run()
-    _assert_clean(at)
-    assert (workspace / "friends" / "jo.csv").is_file()
-    assert "Jo" in at.multiselect(key="h2h_friends").value
 
     at.button(key="remove_upload").click()
     at.run()
