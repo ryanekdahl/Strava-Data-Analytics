@@ -37,12 +37,20 @@ heart rate.
 |---|---|
 | **Overview** | Total distance, runs, moving time and elevation gain (with the change from the previous period of the same length when a period is picked); current and longest weekly streak, typical and biggest week; weekly and monthly distance |
 | **Activities** | Any run, found by searching titles or narrowing by distance, with its route coloured by pace or heart rate; distance, time, pace, grade-adjusted pace, heart rate and cadence; its elevation, pace and heart rate stacked on one distance axis with climbs and descents shaded; per-kilometre (or per-mile) splits |
-| **Best efforts** | True in-run best efforts from the GPS files (or whole-run PRs without them), Riegel race predictions from current form, and a race-time calculator |
+| **Best efforts** | **PR watch**: your best of the last 90 days at each distance against your all-time record, flagging the PRs within reach (≤3% off) and the even pace that would break them, plus a teaser on the Overview; true in-run best efforts from the GPS files (or whole-run PRs without them), Riegel race predictions from current form, and a race-time calculator |
 | **Fitness & Freshness** | Fitness, Fatigue and Form (CTL / ATL / TSB) over time with today's reading, the acute:chronic workload ratio against its sweet-spot band, and the exact load formula behind both. Rides, swims and other sessions count toward the load |
 | **Heart rate** | Share of time in zones Z1–Z5 (second by second when the GPS files are present), monthly hours by zone, and each zone's bpm range |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 
 ## Methodology
+
+### Near-PR alerts — `src/near_pr.py`
+Strava only marks a best effort once it falls. PR watch compares, at each named
+distance, the fastest effort of the last 90 days (counted back from the latest run)
+with the all-time record. `gap_pct = (recent − PR) / PR × 100`; a distance is
+**Within reach** at ≤3%, **Getting close** at ≤8%, **New PR** when the record itself
+was set in the window. The pace to beat is `(PR − 1 s) / distance`. Efforts come from
+the GPS files when present, otherwise from whole runs at their average pace.
 
 Everything below is implemented in `src/` and covered by tests in `tests/`. The
 constants are stated because a metric you cannot audit is a metric you cannot

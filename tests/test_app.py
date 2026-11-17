@@ -87,6 +87,11 @@ def test_best_efforts_and_race_calculator(app):
     app.text_input(key="calc_time").set_value(good).run()
 
 
+def test_pr_watch_compares_recent_form_with_records(app):
+    assert any(h.value == "PR watch" for h in app.subheader)
+    assert any(m.label == "Within reach" for m in app.metric)
+
+
 def test_run_detail_grade_adjusted_pace(app):
     gap = next(m for m in app.metric if m.label == "Grade-adjusted pace")
     assert gap.value != "--"

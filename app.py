@@ -43,6 +43,9 @@ from src.heart_rate import (
     hr_coverage, monthly_zone_hours, stream_monthly_zone_hours, stream_zone_distribution,
     zone_distribution,
 )
+from src.near_pr import (
+    GETTING_CLOSE, NEW_PR, STATUS_ORDER, WITHIN_REACH, chances, near_pr_table, whole_run_efforts,
+)
 from src.loader import SAMPLE_CSV, find_real_export, load_activities, load_other_activities
 from src.performance import (
     RECENT_WINDOW_DAYS, RIEGEL_EXPONENT, Effort, best_recent_effort, format_duration,
@@ -418,6 +421,7 @@ def overview_tab(data: dict) -> None:
     bottom[3].metric("Biggest week", units.format_distance(weekly["distance_km"].max(), 0)
                      if not weekly.empty else "--")
 
+    pr_teaser(data["near_pr"])
     st.plotly_chart(plots.weekly_volume_figure(weekly, units), width="stretch")
     st.caption("Distance run each calendar week. Empty weeks are shown as gaps, not skipped.")
     st.plotly_chart(plots.monthly_volume_figure(data["monthly"], units), width="stretch")
@@ -516,9 +520,70 @@ def reference_effort(activities: pd.DataFrame, stream_data, units: Units) -> tup
                     f"{format_duration(effort.time_s)}")
 
 
+def format_gap(seconds: float) -> str:
+    """A time gap as ``4 s`` under a minute, ``1:05`` above."""
+    return f"{seconds:.0f} s" if seconds < 59.5 else format_duration(seconds)
+
+
+def pr_teaser(near: pd.DataFrame) -> None:
+    """One line on the Overview pointing at the PRs within reach."""
+    within = chances(near)
+    if within.empty:
+        return
+    listed = ", ".join(f"**{r.distance}** ({format_gap(r.gap_s)} off)"
+                       for r in within.head(3).itertuples())
+    count = len(within)
+    st.info(f"{count} PR{'s' if count > 1 else ''} within reach: {listed}. "
+            "See **Best efforts** for the pace it would take.", icon=":material/target:")
+
+
+def pr_watch(near: pd.DataFrame, units: Units) -> None:
+    """How close recent form is to each PR, and what it would take to break the close ones."""
+    st.subheader("PR watch")
+    if near.empty:
+        st.info("No best efforts yet to compare against.")
+        return
+    counts = near["status"].value_counts()
+    cards = st.columns(3)
+    cards[0].metric(f"New PRs (last {RECENT_WINDOW_DAYS} days)", f"{counts.get(NEW_PR, 0)}")
+    cards[1].metric("Within reach", f"{counts.get(WITHIN_REACH, 0)}",
+                    help="Recent best no more than 3% slower than the PR.")
+    cards[2].metric("Getting close", f"{counts.get(GETTING_CLOSE, 0)}",
+                    help="Recent best 3-8% slower than the PR.")
+
+    for r in chances(near).head(3).itertuples():
+        st.success(
+            f"**{r.distance}: {format_gap(r.gap_s)} off your PR.** Your best in the last "
+            f"{RECENT_WINDOW_DAYS} days is {format_duration(r.recent_time_s)} "
+            f"({r.recent_date:%d %b}); the record is {format_duration(r.pr_time_s)} from "
+            f"{r.pr_date:%d %b %Y}. Hold **{units.format_pace(r.target_pace_min_per_km)}** "
+            f"to break it.", icon=":material/target:")
+
+    ordered = near.assign(order=near["status"].map(STATUS_ORDER.index))
+    ordered = ordered.sort_values(["order", "gap_pct", "distance_km"])
+    st.dataframe(pd.DataFrame({
+        "Distance": ordered["distance"],
+        "Status": ordered["status"],
+        "PR": ordered["pr_time_s"].map(format_duration),
+        "Set on": ordered["pr_date"].dt.strftime("%d %b %Y"),
+        f"Best, last {RECENT_WINDOW_DAYS} days": ordered["recent_time_s"].map(
+            lambda t: format_duration(t) if pd.notna(t) else "--"),
+        "Gap": [("--" if pd.isna(g) else "PR" if s == NEW_PR else f"+{format_gap(g)} ({p:.1f}%)")
+                for g, p, s in zip(ordered["gap_s"], ordered["gap_pct"], ordered["status"])],
+        "Pace to beat": ordered["target_pace_min_per_km"].map(units.format_pace),
+    }), hide_index=True, width="stretch")
+    st.caption(
+        f"Your fastest effort of the last {RECENT_WINDOW_DAYS} days at each distance against "
+        "your all-time record, whatever period the sidebar shows. Strava only marks a best "
+        "effort once it falls; this flags the records you are close to *before* you break "
+        "them. Pace to beat is the even pace that takes one second off the PR."
+    )
+
+
 def best_efforts_tab(data: dict, stream_data) -> None:
-    """Strava's best efforts and PRs, plus race predictions from current form."""
+    """Strava's best efforts and PRs, near-PR alerts, and race predictions from current form."""
     activities, records, units = data["activities"], data["records"], data["units"]
+    pr_watch(data["near_pr"], units)
     if stream_data is not None and not stream_data.best.empty:
         gps_best_efforts(activities, stream_data, units)
     else:
@@ -907,6 +972,9 @@ def main() -> None:
                    "left out of the GPS-based views.")
     stream_data = (streams.restrict(all_streams, activities["activity_id"])
                    if all_streams is not None else None)
+    has_gps = all_streams is not None and not all_streams.best.empty
+    data["near_pr"] = near_pr_table(all_streams.best if has_gps
+                                    else whole_run_efforts(all_activities))
 
     overview, run_detail, efforts, fitness, heart_rate, gear = st.tabs(
         ["Overview", "Activities", "Best efforts", "Fitness & Freshness", "Heart rate", "Gear"]
