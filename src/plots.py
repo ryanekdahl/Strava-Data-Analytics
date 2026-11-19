@@ -21,7 +21,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from src.consistency import SWEET_SPOT
-from src.performance import format_pace
+from src.performance import format_duration, format_pace
 from src.units import METRIC, Units
 
 SURFACE = "#fcfcfb"
@@ -653,6 +653,366 @@ def route_map_figure(
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False, scaleanchor="x",
                      scaleratio=1.0 / np.cos(np.radians(float(route["lat"].mean()))))
+    return fig
+
+
+# Pace heat: fastest (hot red) -> median (neutral) -> slowest (cool blue).  Validated
+# for adjacent-pair separation (normal vision and CVD); the light neutral middle is
+# kept visible on a white map by the dark casing drawn under the route.
+PACE_HEAT_COLORS = ["#8c1616", "#d93b3a", "#f4908f", "#e2e1dc", "#7fb0ee", "#2a78d6", "#0f3a72"]
+NO_PACE_COLOR = AXIS
+
+
+def _band_colors(n: int) -> list[str]:
+    """``n`` diverging band colours, fastest first (``n`` is odd; 7 uses the full scale)."""
+    if n == len(PACE_HEAT_COLORS):
+        return list(PACE_HEAT_COLORS)
+    picks = np.linspace(0, len(PACE_HEAT_COLORS) - 1, n).round().astype(int)
+    return [PACE_HEAT_COLORS[i] for i in picks]
+
+
+def _segment_path(segs: pd.DataFrame) -> tuple[list, list]:
+    """Lat and lon lists that draw each segment, with consecutive ones joined.
+
+    One trace per colour band keeps the figure light; ``None`` breaks the line
+    wherever the next segment of this band does not start where the last ended.
+    """
+    lats: list = []
+    lons: list = []
+    last_end = None
+    for s in segs.itertuples():
+        if last_end != (s.lat0, s.lon0):
+            if lats:
+                lats.append(None)
+                lons.append(None)
+            lats.append(s.lat0)
+            lons.append(s.lon0)
+        lats.append(s.lat1)
+        lons.append(s.lon1)
+        last_end = (s.lat1, s.lon1)
+    return lats, lons
+
+
+def pace_heatmap_figure(heat, extremes: pd.DataFrame, units: Units = METRIC,
+                        basemap: bool = False) -> go.Figure:
+    """The route painted by pace: hot where you were fast, cool where you eased off.
+
+    ``heat`` comes from :func:`src.pace_heat.pace_heat`, ``extremes`` from
+    :func:`src.pace_heat.split_extremes`.  Three linked views, one colour key:
+
+    * the **map** -- a continuous line, each stretch coloured by its pace band
+      (centred on the run's own median), with the fastest and slowest split
+      labelled where they happened;
+    * the **distribution** beside it -- how much of the run's distance fell in
+      each band, which doubles as the legend;
+    * the **pace ribbon** underneath -- the same colours laid out along the
+      distance axis, so you can see *when* in the run each band came, ticked
+      at every kilometre or mile.
+
+    Nothing needs scrubbing: the shape of the run is readable without a hover.
+    """
+    segs, bands = heat.segments, heat.bands
+    colors = _band_colors(len(bands))
+    lat_mid = float(np.nanmean(np.concatenate([segs["lat0"], segs["lat1"]])))
+    lon_mid = float(np.nanmean(np.concatenate([segs["lon0"], segs["lon1"]])))
+
+    fig = make_subplots(
+        rows=2, cols=2, column_widths=[0.7, 0.3], row_heights=[0.8, 0.2],
+        horizontal_spacing=0.12, vertical_spacing=0.09,  # the gap holds the band labels
+        specs=[[{"type": "map" if basemap else "xy"}, {"type": "xy"}],
+               [{"type": "xy", "colspan": 2}, None]],
+    )
+    point = go.Scattermap if basemap else go.Scatter
+
+    def where(lats, lons) -> dict:
+        return dict(lat=lats, lon=lons) if basemap else dict(x=lons, y=lats)
+
+    # The map: a dark casing under everything, then one line trace per band.
+    all_lat, all_lon = _segment_path(segs)
+    fig.add_trace(point(**where(all_lat, all_lon), mode="lines", hoverinfo="skip",
+                        line=dict(color=INK_SECONDARY, width=8), opacity=0.55), row=1, col=1)
+    gaps = segs[segs["band"] < 0]
+    if not gaps.empty:
+        fig.add_trace(point(**where(*_segment_path(gaps)), mode="lines", hoverinfo="skip",
+                            line=dict(color=NO_PACE_COLOR, width=5)), row=1, col=1)
+    for b in bands.itertuples():
+        in_band = segs[segs["band"] == b.band]
+        if in_band.empty:
+            continue
+        fig.add_trace(point(**where(*_segment_path(in_band)), mode="lines", hoverinfo="skip",
+                            line=dict(color=colors[b.band], width=5)), row=1, col=1)
+
+    # Hover: map lines do not take hover, so an invisible dot sits on each stretch.
+    paced = segs[segs["band"] >= 0]
+    diff_s = (paced["pace"] - heat.median) * 60.0
+    hover = [
+        f"{units.format_distance(d / 1000.0, 2)}<br>"
+        f"<b>{format_pace(p, suffix=' /' + units.distance_label)}</b><br>"
+        + (f"{abs(ds):.0f} s {'faster' if ds < 0 else 'slower'} than median"
+           if abs(ds) >= 1 else "at the median pace")
+        for d, p, ds in zip(paced["distance_m"], paced["pace"], diff_s)
+    ]
+    fig.add_trace(point(
+        **where((paced["lat0"] + paced["lat1"]) / 2, (paced["lon0"] + paced["lon1"]) / 2),
+        mode="markers", marker=dict(size=14, color=INK, opacity=0),
+        text=hover, hovertemplate="%{text}<extra></extra>",
+    ), row=1, col=1)
+
+    # Start / finish, then the fastest and slowest split, labelled in place.
+    ends_lat = [segs["lat0"].iloc[0], segs["lat1"].iloc[-1]]
+    ends_lon = [segs["lon0"].iloc[0], segs["lon1"].iloc[-1]]
+    fig.add_trace(point(**where(ends_lat, ends_lon), mode="markers+text",
+                        text=["Start", "Finish"], textposition="top right",
+                        textfont=dict(color=INK, size=12), hoverinfo="skip",
+                        marker=dict(color=INK, size=10)), row=1, col=1)
+    if not extremes.empty:
+        label = units.split_label.lower().replace("kilometre", "km")
+        texts = [f"<b>{e.kind.capitalize()} {label} {e.split}</b> "
+                 f"{format_pace(e.pace, suffix='')}" for e in extremes.itertuples()]
+        # The northern label sits above its marker and the other below, so two neighbouring
+        # splits never collide, and centred text does not run off the side of the panel.
+        north = extremes["lat"].to_numpy() >= extremes["lat"].max()
+        # One trace each: map traces take a single text position, not one per point.
+        for e, text, n in zip(extremes.itertuples(), texts, north):
+            fig.add_trace(point(
+                **where([e.lat], [e.lon]), mode="markers+text", text=[text],
+                textposition="top center" if n else "bottom center",
+                textfont=dict(color=INK, size=12), hoverinfo="skip",
+                marker=dict(size=13, color=colors[0] if e.kind == "fastest" else colors[-1])),
+                row=1, col=1)
+
+    # Distribution = legend: share of distance in each band, fastest on top.
+    shares = bands["share"].to_numpy() * 100.0
+    middle = len(bands) // 2
+    fig.add_trace(go.Bar(
+        x=shares, y=list(bands["label"]), orientation="h",
+        marker=dict(color=colors, cornerradius=4, line=dict(color=INK_SECONDARY, width=0.5)),
+        text=[f"{s:.0f}%" + (" · median" if i == middle else "") for i, s in enumerate(shares)],
+        textposition="outside", cliponaxis=False, textfont=dict(color=INK_SECONDARY, size=12),
+        hovertemplate="%{y}<br>%{x:.0f}% of the distance<extra></extra>",
+    ), row=1, col=2)
+    fig.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(color=INK, size=12),
+                     ticks="", row=1, col=2)
+    fig.update_xaxes(visible=False, range=[0, max(float(shares.max()), 1.0) * 1.7],
+                     row=1, col=2)
+
+    # Ribbon: every stretch as a coloured block along the distance axis.
+    starts = units.distance((segs["distance_m"] - segs["length_m"] / 2) / 1000.0)
+    widths = units.distance(segs["length_m"] / 1000.0)
+    block_colors = [colors[b] if b >= 0 else NO_PACE_COLOR for b in segs["band"]]
+    ribbon_hover = [
+        f"{units.format_distance(d / 1000.0, 2)}<br>"
+        + (format_pace(p, suffix=" /" + units.distance_label) if b >= 0 else "no pace")
+        for d, p, b in zip(segs["distance_m"], segs["pace"], segs["band"])
+    ]
+    fig.add_trace(go.Bar(
+        x=widths, base=starts, y=["Pace"] * len(segs), orientation="h",
+        marker=dict(color=block_colors, line=dict(width=0)), width=0.9,
+        text=ribbon_hover, hovertemplate="%{text}<extra></extra>", textposition="none",
+    ), row=2, col=1)
+    total = float(units.distance((segs["distance_m"] + segs["length_m"] / 2).iloc[-1] / 1000.0))
+    fig.update_yaxes(visible=False, row=2, col=1)
+    fig.update_xaxes(range=[0, total], dtick=1 if total <= 30 else 5, showgrid=False,
+                     row=2, col=1)
+    if not extremes.empty:
+        for e in extremes.itertuples():
+            x = e.split - 0.5  # the middle of that split, in display distance
+            fig.add_annotation(x=x, y=1.0, xref="x2" if basemap else "x3",
+                               yref=("y2" if basemap else "y3") + " domain",
+                               yanchor="bottom", showarrow=False,
+                               text=f"{e.kind}", font=dict(size=11, color=MUTED))
+
+    title = (f"Pace heat map  ·  median {format_pace(heat.median, suffix=' /' + units.distance_label)}"
+             f", bands of {heat.step * 60:.0f} s")
+    _base(fig, height=640)
+    fig.update_layout(title=title, showlegend=False, hovermode="closest", bargap=0,
+                      margin=dict(l=8, r=8, t=48, b=48))
+    fig.update_xaxes(title_text=f"Distance ({units.distance_label})", row=2, col=1)
+    if basemap:
+        lats = pd.concat([segs["lat0"], segs["lat1"]])
+        lons = pd.concat([segs["lon0"], segs["lon1"]])
+        fig.update_layout(map=dict(style="carto-positron", zoom=_route_zoom(lats, lons, 520, 460),
+                                   center=dict(lat=lat_mid, lon=lon_mid)))
+    else:
+        fig.update_xaxes(visible=False, row=1, col=1)
+        fig.update_yaxes(visible=False, scaleanchor="x",
+                         scaleratio=1.0 / np.cos(np.radians(lat_mid)), row=1, col=1)
+    return fig
+
+
+RUNNER = SERIES["fatigue"]
+
+
+def _replay_readout(frame: pd.Series, marks: pd.DataFrame, units: Units) -> str:
+    """The line above the replay: where the runner is, the clock, the pace, the last split."""
+    parts = [f"<b>{units.format_distance(frame['distance_m'] / 1000.0, 2)}</b>",
+             f"{format_duration(frame['moving_s'])} elapsed",
+             f"{units.format_pace(frame['pace_min_per_km'])} now"]
+    if np.isfinite(frame["hr"]):
+        parts.append(f"{frame['hr']:.0f} bpm")
+    passed = marks[marks["moving_s"] <= frame["moving_s"] + 1e-6]
+    if not passed.empty:
+        last = passed.iloc[-1]
+        parts.append(f"{units.split_label} {int(last['split'])} split "
+                     f"{format_pace(units.pace(last['pace_min_per_km']), suffix='')}")
+    return "  ·  ".join(parts)
+
+
+def route_replay_figure(
+    route: pd.DataFrame, frames: pd.DataFrame, marks: pd.DataFrame,
+    units: Units = METRIC, basemap: bool = False, duration_s: float = 20.0,
+) -> go.Figure:
+    """An animated replay: a runner dot crossing the route, its pace drawn as it goes.
+
+    ``frames`` and ``marks`` come from :func:`src.replay.replay_frames` and
+    :func:`src.replay.milestones`.  Frames are evenly spaced in moving time, so
+    at a steady frame rate the dot moves as fast as the run did.  The top
+    panel is the route (the stretch already run coloured by pace, darker for
+    faster, with a numbered marker at each kilometre or mile); the bottom one
+    is pace against distance, filling in behind a cursor, with each split's
+    pace written over its marker line.  Play, Pause and a scrubber sit below.
+    The whole replay lasts about ``duration_s`` seconds whatever the run's
+    length.  ``basemap`` puts the route on CARTO tiles, as in
+    :func:`route_map_figure`.
+    """
+    paces = units.pace(route["pace_min_per_km"]).replace([np.inf, -np.inf], np.nan)
+    finite = paces.dropna()
+    low, high = ((float(finite.quantile(0.05)), float(finite.quantile(0.95)))
+                 if not finite.empty else (0.0, 1.0))
+    if high <= low:
+        high = low + 1.0
+    # The pace line is clipped a little wider than the colours, so a stop's spike stays on the chart.
+    lo_line, hi_line = ((float(finite.quantile(0.02)), float(finite.quantile(0.98)))
+                        if not finite.empty else (low, high))
+    shown = paces.clip(lo_line, hi_line).to_numpy()
+    route_x = units.distance(route["distance_m"].to_numpy() / 1000.0)
+    frame_x = units.distance(frames["distance_m"].to_numpy() / 1000.0)
+    frame_pace = units.pace(frames["pace_min_per_km"]).clip(lo_line, hi_line).to_numpy()
+    lat, lon = route["lat"].to_numpy(), route["lon"].to_numpy()
+
+    point = go.Scattermap if basemap else go.Scatter
+
+    def where(lats, lons) -> dict:
+        return dict(lat=lats, lon=lons) if basemap else dict(x=lons, y=lats)
+
+    scale = [[i / (len(ZONE_COLORS) - 1), color] for i, color in enumerate(ZONE_COLORS)]
+    ticks = np.linspace(low, high, 5)
+    trail_marker = dict(
+        colorscale=scale, cmin=low, cmax=high, reversescale=True, size=6,
+        colorbar=dict(thickness=10, outlinewidth=0, len=0.6, y=1.0, yanchor="top",
+                      tickfont=dict(color=MUTED), title=dict(text=units.pace_label),
+                      tickmode="array", tickvals=ticks,
+                      ticktext=[format_pace(t, suffix="") for t in ticks]),
+    )
+
+    def moving_traces(i: int) -> list:
+        """The four traces that change from frame to frame, at frame ``i``."""
+        frame = frames.iloc[i]
+        k = int(frame["trail"])
+        trail_lat = np.append(lat[:k], frame["lat"])
+        trail_lon = np.append(lon[:k], frame["lon"])
+        trail_pace = np.append(np.clip(paces.to_numpy()[:k], low, high),
+                               np.clip(units.pace(frame["pace_min_per_km"]), low, high))
+        return [
+            point(**where(trail_lat, trail_lon), mode="markers", hoverinfo="skip",
+                  marker=dict(trail_marker, color=trail_pace)),
+            point(**where([frame["lat"]], [frame["lon"]]), mode="markers", hoverinfo="skip",
+                  marker=dict(color=RUNNER, size=16)),
+            go.Scatter(x=np.append(route_x[:k], frame_x[i]),
+                       y=np.append(shown[:k], frame_pace[i]), mode="lines",
+                       hoverinfo="skip", line=dict(color=SERIES["fitness"], width=2)),
+            go.Scatter(x=[frame_x[i]], y=[frame_pace[i]], mode="markers", hoverinfo="skip",
+                       marker=dict(color=RUNNER, size=11, line=dict(width=2, color=SURFACE))),
+        ]
+
+    fig = make_subplots(
+        rows=2, cols=1, row_heights=[0.68, 0.32], vertical_spacing=0.07,
+        specs=[[{"type": "map" if basemap else "xy"}], [{"type": "xy"}]],
+    )
+    # 0: the whole route, faint, so you can see where the runner is headed.
+    fig.add_trace(point(**where(lat, lon), mode="lines", hoverinfo="skip",
+                        line=dict(color=AXIS, width=3)), row=1, col=1)
+    # 1 and 3 (map) and 5-6 (pace chart) move; 4 is the whole pace line, faint.
+    first = moving_traces(0)
+    fig.add_trace(first[0], row=1, col=1)
+    # 2: a numbered marker at each kilometre or mile, above the trail, below the runner.
+    mark_hover = [
+        f"{units.split_label} {int(m.split)}<br>reached at {format_duration(m.moving_s)}"
+        f"<br>split {format_duration(m.split_s)} "
+        f"({units.format_pace(m.pace_min_per_km)})"
+        for m in marks.itertuples()
+    ]
+    fig.add_trace(point(
+        **where(marks["lat"], marks["lon"]), mode="markers+text",
+        text=[str(int(s)) for s in marks["split"]], textposition="top center",
+        textfont=dict(color=INK, size=12), marker=dict(color=INK, size=8),
+        hovertext=mark_hover, hovertemplate="%{hovertext}<extra></extra>",
+    ), row=1, col=1)
+    fig.add_trace(first[1], row=1, col=1)
+    fig.add_trace(go.Scatter(x=route_x, y=shown, mode="lines", line=dict(color=GRID, width=1.5),
+                             hoverinfo="skip"), row=2, col=1)
+    fig.add_trace(first[2], row=2, col=1)
+    fig.add_trace(first[3], row=2, col=1)
+
+    # add_vline cannot be used: it inspects every trace's x-axis, and map traces have none.
+    xref, yref = ("x", "y") if basemap else ("x2", "y2")
+    label_splits = len(marks) <= 16  # past that the pace labels would overlap
+    previous = 0.0
+    for m in marks.itertuples():
+        x = units.distance(m.distance_m / 1000.0)
+        fig.add_shape(type="line", xref=xref, yref=f"{yref} domain", x0=x, x1=x, y0=0, y1=1,
+                      line=dict(color=AXIS, width=1, dash="dot"), layer="below")
+        middle, previous = (previous + x) / 2.0, x  # each split's pace sits over that split
+        if label_splits:
+            fig.add_annotation(xref=xref, yref=f"{yref} domain", x=middle, y=1.0,
+                               yanchor="bottom",
+                               showarrow=False, font=dict(size=10, color=MUTED),
+                               text=format_pace(units.pace(m.pace_min_per_km), suffix=""))
+
+    readouts = [_replay_readout(frames.iloc[i], marks, units) for i in range(len(frames))]
+    fig.frames = [
+        go.Frame(name=str(i), data=moving_traces(i), traces=[1, 3, 5, 6],
+                 layout=dict(title=dict(text=readouts[i])))
+        for i in range(len(frames))
+    ]
+    step_ms = max(int(duration_s * 1000 / max(len(frames), 1)), 16)
+    play = dict(frame=dict(duration=step_ms, redraw=True), transition=dict(duration=0),
+                fromcurrent=True, mode="immediate")
+    still = dict(frame=dict(duration=0, redraw=True), transition=dict(duration=0),
+                 mode="immediate")
+
+    _base(fig, height=700)
+    fig.update_layout(
+        title=dict(text=readouts[0] if readouts else "", font=dict(size=14, color=INK)),
+        showlegend=False, hovermode="closest",
+        margin=dict(l=8, r=8, t=48, b=110),
+        updatemenus=[dict(
+            type="buttons", direction="left", showactive=False,
+            x=0, xanchor="left", y=-0.115, yanchor="top", pad=dict(t=0, r=8),
+            bgcolor=SURFACE, bordercolor=AXIS, font=dict(color=INK),
+            buttons=[dict(label="▶ Play", method="animate", args=[None, play]),
+                     dict(label="❚❚ Pause", method="animate", args=[[None], still])],
+        )],
+        sliders=[dict(
+            active=0, x=0.17, len=0.83, y=-0.105, yanchor="top", pad=dict(t=0),
+            currentvalue=dict(visible=False), ticklen=0, minorticklen=0,
+            bordercolor=AXIS, bgcolor=GRID, activebgcolor=RUNNER, font=dict(size=1),
+            steps=[dict(method="animate", label="", args=[[str(i)], still])
+                   for i in range(len(frames))],
+        )],
+    )
+    if basemap:
+        fig.update_layout(map=dict(
+            style="carto-positron", zoom=_route_zoom(route["lat"], route["lon"], height_px=440),
+            center=dict(lat=float(route["lat"].mean()), lon=float(route["lon"].mean()))))
+    else:
+        fig.update_xaxes(visible=False, row=1, col=1)
+        fig.update_yaxes(visible=False, scaleanchor="x",
+                         scaleratio=1.0 / np.cos(np.radians(float(route["lat"].mean()))),
+                         row=1, col=1)
+    fig.update_xaxes(title_text=f"Distance ({units.distance_label})", row=2, col=1)
+    fig.update_yaxes(title_text=units.pace_label, row=2, col=1)
+    _pace_axis(fig, pd.Series(shown), row=2, col=1)
     return fig
 
 

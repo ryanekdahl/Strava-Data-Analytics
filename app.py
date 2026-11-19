@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from src import plots, streams, terrain, upload
+from src import pace_heat, plots, replay, streams, terrain, upload
 from src.consistency import (
     SWEET_SPOT, acwr_status, compute_acwr, monthly_volume, summary_kpis,
     weekly_streaks, weekly_volume,
@@ -48,7 +48,7 @@ from src.near_pr import (
 )
 from src.loader import SAMPLE_CSV, find_real_export, load_activities, load_other_activities
 from src.performance import (
-    RECENT_WINDOW_DAYS, RIEGEL_EXPONENT, Effort, best_recent_effort, format_duration,
+    RECENT_WINDOW_DAYS, RIEGEL_EXPONENT, Effort, best_recent_effort, format_duration, format_pace,
     personal_records, predict_races,
 )
 from src.sports import compute_other_load
@@ -774,6 +774,7 @@ def run_detail_tab(data: dict, stream_data, path: Path) -> None:
 
     route = streams.route_for(activity_id, data["all_activities"], path)
     route_map(route, units)
+    route_replay(route, units)
     terrain_section(route, units)
 
     left, right = st.columns(2)
@@ -890,6 +891,9 @@ def route_map(route: pd.DataFrame, units: Units) -> None:
         help="Draws the route on CARTO / OpenStreetMap tiles. Your browser downloads the "
              "tiles, which tells CARTO roughly where this run was -- the only thing in the "
              "app that goes over the network. Off, the route is drawn with no map behind it.")
+    if options[color_by] == "pace":
+        pace_heat_map(route, units, basemap)
+        return
     st.plotly_chart(plots.route_map_figure(route, options[color_by], units, basemap),
                     width="stretch")
     st.caption(
@@ -897,6 +901,75 @@ def route_map(route: pd.DataFrame, units: Units) -> None:
         "own 5th-95th percentile so one GPS spike cannot flatten the rest. Pace is smoothed "
         "over a few points either side, so short surges are softened."
     )
+
+
+def pace_heat_map(route: pd.DataFrame, units: Units, basemap: bool) -> None:
+    """The route painted hot (faster) to cool (slower) around the run's median pace."""
+    heat = pace_heat.pace_heat(route, units)
+    if heat.empty:
+        st.caption("This recording has no usable pace along the route.")
+        return
+    extremes = pace_heat.split_extremes(route, units)
+    st.plotly_chart(plots.pace_heatmap_figure(heat, extremes, units, basemap),
+                    width="stretch", key="pace_heat_map")
+    st.markdown(pace_heat_reading(heat, extremes, units))
+    st.caption(
+        f"Each stretch of the route is coloured by its pace against this run's own median: "
+        f"red is faster, blue slower, grey within about {heat.step * 30:.0f} s of the median. "
+        f"Bands are {heat.step * 60:.0f} s wide and the outer two are open-ended, so a stop or "
+        f"a GPS spike lands in \"or slower\" instead of stretching the scale. The bar chart "
+        f"is both the legend and how much of the distance fell in each band; the strip below "
+        f"lays the same colours along the distance, so you can see when each one came."
+    )
+
+
+def pace_heat_reading(heat: pace_heat.PaceHeat, extremes: pd.DataFrame, units: Units) -> str:
+    """One sentence that says what the heat map shows, so nobody has to scrub for it."""
+    bands = heat.bands
+    middle = len(bands) // 2
+    faster = float(bands["share"].iloc[:middle].sum())
+    slower = float(bands["share"].iloc[middle + 1:].sum())
+    near = pace_heat.near_median_share(heat)
+    unit = units.distance_label
+    sentence = (f"Median pace **{format_pace(heat.median, suffix=' /' + unit)}**: "
+                f"{near:.0%} of the distance close to it, {faster:.0%} faster and "
+                f"{slower:.0%} slower")
+    if not extremes.empty:
+        fast, slow = extremes.set_index("kind").loc["fastest"], \
+            extremes.set_index("kind").loc["slowest"]
+        label = units.split_label.lower()
+        sentence += (f". Fastest {label}: **{int(fast['split'])}** "
+                     f"({format_pace(fast['pace'], suffix=' /' + unit)}); slowest: "
+                     f"**{int(slow['split'])}** ({format_pace(slow['pace'], suffix=' /' + unit)})")
+    return sentence + "."
+
+
+REPLAY_LENGTHS = {"10 s": 10.0, "20 s": 20.0, "40 s": 40.0, "1 min": 60.0}
+
+
+def route_replay(route: pd.DataFrame, units: Units) -> None:
+    """Play the run back: a dot crossing the route on the run's own clock, pace drawn below."""
+    frames = replay.replay_frames(route)
+    if frames.empty:
+        return
+    with st.expander("▶ Replay this run", expanded=False):
+        length = st.segmented_control(
+            "Replay length", list(REPLAY_LENGTHS), default="20 s", key="replay_length",
+            help="How long the whole run takes to play back. The dot keeps the run's own "
+                 "rhythm at any length: fast stretches still pass quicker than slow ones.")
+        marks = replay.milestones(route, units.split_m)
+        st.plotly_chart(
+            plots.route_replay_figure(route, frames, marks, units,
+                                      basemap=st.session_state.get("route_basemap", False),
+                                      duration_s=REPLAY_LENGTHS[length or "20 s"]),
+            width="stretch", key="route_replay")
+        st.caption(
+            f"Press Play, or drag the slider to scrub. The dot moves on your moving time, so "
+            f"it slows where you slowed and stops are skipped. Numbered markers are each "
+            f"{units.split_label.lower()}; the line above the map gives your distance, "
+            f"elapsed time, current pace and your last {units.split_label.lower()} split. The "
+            f"street map follows the toggle above."
+        )
 
 
 def gear_tab(data: dict) -> None:

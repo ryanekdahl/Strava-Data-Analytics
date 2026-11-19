@@ -61,10 +61,21 @@ def test_a_period_compares_with_the_one_before(app):
 
 
 def test_route_map_with_and_without_street_tiles(app):
+    app.radio(key="route_color").set_value("Pace").run()
+    _assert_clean(app)
+    assert any("Median pace" in m.value for m in app.markdown)
     app.radio(key="route_color").set_value("Heart rate").run()
     _assert_clean(app)
     app.toggle(key="route_basemap").set_value(True).run()
     _assert_clean(app)
+
+
+def test_run_replay_plays_on_both_backdrops(app):
+    for basemap in (True, False):
+        app.toggle(key="route_basemap").set_value(basemap).run()
+        _assert_clean(app)
+        app.segmented_control(key="replay_length").set_value("10 s").run()
+        _assert_clean(app)
 
 
 def test_six_tabs(app):

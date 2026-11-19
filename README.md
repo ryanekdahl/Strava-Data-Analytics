@@ -36,13 +36,25 @@ heart rate.
 | Tab | What you get |
 |---|---|
 | **Overview** | Total distance, runs, moving time and elevation gain (with the change from the previous period of the same length when a period is picked); current and longest weekly streak, typical and biggest week; weekly and monthly distance |
-| **Activities** | Any run, found by searching titles or narrowing by distance, with its route coloured by pace or heart rate; distance, time, pace, grade-adjusted pace, heart rate and cadence; its elevation, pace and heart rate stacked on one distance axis with climbs and descents shaded; per-kilometre (or per-mile) splits |
+| **Activities** | Any run, found by searching titles or narrowing by distance, with a **pace heat map** (the route painted red where you ran faster than that run's median and blue where you ran slower, beside how much of the distance fell in each pace band, a strip of the same colours along the distance, and the fastest and slowest split labelled on the map), the route by heart rate, and an animated **replay** (a dot crossing the route on the run's own clock, pace filling in below, each km or mile marked with its split); distance, time, pace, grade-adjusted pace, heart rate and cadence; its elevation, pace and heart rate stacked on one distance axis with climbs and descents shaded; per-kilometre (or per-mile) splits |
 | **Best efforts** | **PR watch**: your best of the last 90 days at each distance against your all-time record, flagging the PRs within reach (≤3% off) and the even pace that would break them, plus a teaser on the Overview; true in-run best efforts from the GPS files (or whole-run PRs without them), Riegel race predictions from current form, and a race-time calculator |
 | **Fitness & Freshness** | Fitness, Fatigue and Form (CTL / ATL / TSB) over time with today's reading, the acute:chronic workload ratio against its sweet-spot band, and the exact load formula behind both. Rides, swims and other sessions count toward the load |
 | **Heart rate** | Share of time in zones Z1–Z5 (second by second when the GPS files are present), monthly hours by zone, and each zone's bpm range |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 
 ## Methodology
+
+### Pace heat map — `src/pace_heat.py`
+Each stretch of the route (a pair of consecutive GPS points, using the smoothed
+pace) is put in one of seven pace bands centred on the run's **distance-weighted
+median pace**. The band width is the 5th–95th percentile range split seven ways,
+rounded to a whole number of 5-second steps (at least 5 s), in the display unit.
+The two outer bands are open-ended, so a stop or a GPS spike lands in "over"
+instead of stretching the scale. A band's share is the distance run in it
+divided by the distance with a usable pace. The fastest and slowest whole split
+are labelled when the run has at least three. The colours are a diverging scale
+(red faster, grey median, blue slower), checked for adjacent-band separation
+under normal and colour-blind vision.
 
 ### Near-PR alerts — `src/near_pr.py`
 Strava only marks a best effort once it falls. PR watch compares, at each named
