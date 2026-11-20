@@ -80,7 +80,19 @@ def test_run_replay_plays_on_both_backdrops(app):
 
 def test_six_tabs(app):
     assert [tab.label for tab in app.tabs] == [
-        "Overview", "Activities", "Best efforts", "Fitness & Freshness", "Heart rate", "Gear"]
+        "Overview", "Activities", "Routes", "Best efforts", "Fitness & Freshness", "Heart rate",
+        "Gear"]
+
+
+def test_routes_tab_shows_the_pr_heat_map_for_each_route(app):
+    picker = app.selectbox(key="route_pick")
+    assert len(picker.options) >= 3  # the sample runner's regular routes
+    for option in picker.options[:2]:
+        picker.set_value(option).run()
+        _assert_clean(app)
+        assert any("Median pace" in m.value for m in app.markdown)
+    app.toggle(key="routes_basemap").set_value(True).run()
+    _assert_clean(app)
 
 
 def test_fitness_tab_shows_load_and_workload_ratio(app):

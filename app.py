@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from src import pace_heat, plots, replay, streams, terrain, upload
+from src import pace_heat, plots, replay, routes, streams, terrain, upload
 from src.consistency import (
     SWEET_SPOT, acwr_status, compute_acwr, monthly_volume, summary_kpis,
     weekly_streaks, weekly_volume,
@@ -126,9 +126,25 @@ def prepare_streams(path: Path, activities: pd.DataFrame) -> streams.StreamData 
             bar.progress(done / len(pending),
                          text=f"Reading GPS recordings: {done:,} of {len(pending):,}")
         bar.empty()
+    return read_streams(str(path), path.stat().st_mtime, stream_token(path))
+
+
+def stream_token(path: Path) -> int:
+    """Changes whenever the GPS summary cache does, so cached views built on it refresh."""
     cache_dir = streams.cache_dir_for(path)
-    token = cache_dir.stat().st_mtime_ns if cache_dir.is_dir() else 0
-    return read_streams(str(path), path.stat().st_mtime, token)
+    return cache_dir.stat().st_mtime_ns if cache_dir.is_dir() else 0
+
+
+@st.cache_data(show_spinner="Finding your regular routes...", ttl=CACHE_TTL,
+               max_entries=CACHE_ENTRIES)
+def find_routes(path: str, mtime: float, cache_token: int) -> tuple[dict, pd.DataFrame]:
+    """Every run's track and which runs share a route, across the whole history.
+
+    ``mtime`` and ``cache_token`` are hashed (no leading underscore), so a new
+    export or newly parsed GPS files rebuild the grouping.
+    """
+    tracks = streams.cached_tracks(load_activities(path), path)
+    return tracks, routes.group_routes(tracks)
 
 
 def choose_source() -> Path:
@@ -903,7 +919,8 @@ def route_map(route: pd.DataFrame, units: Units) -> None:
     )
 
 
-def pace_heat_map(route: pd.DataFrame, units: Units, basemap: bool) -> None:
+def pace_heat_map(route: pd.DataFrame, units: Units, basemap: bool,
+                  key: str = "pace_heat_map") -> None:
     """The route painted hot (faster) to cool (slower) around the run's median pace."""
     heat = pace_heat.pace_heat(route, units)
     if heat.empty:
@@ -911,7 +928,7 @@ def pace_heat_map(route: pd.DataFrame, units: Units, basemap: bool) -> None:
         return
     extremes = pace_heat.split_extremes(route, units)
     st.plotly_chart(plots.pace_heatmap_figure(heat, extremes, units, basemap),
-                    width="stretch", key="pace_heat_map")
+                    width="stretch", key=key)
     st.markdown(pace_heat_reading(heat, extremes, units))
     st.caption(
         f"Each stretch of the route is coloured by its pace against this run's own median: "
@@ -970,6 +987,78 @@ def route_replay(route: pd.DataFrame, units: Units) -> None:
             f"elapsed time, current pace and your last {units.split_label.lower()} split. The "
             f"street map follows the toggle above."
         )
+
+
+def routes_tab(data: dict, stream_data, path: Path) -> None:
+    """The routes you run most, each with the heat map of the run that set its PR."""
+    activities, units = data["activities"], data["units"]
+    if stream_data is None or stream_data.status["parsed"] == 0:
+        st.info(NO_STREAMS_HELP)
+        return
+    tracks, groups = find_routes(str(path), path.stat().st_mtime, stream_token(path))
+    table = routes.route_table(groups, activities, tracks, distance_text=units.format_distance)
+    if table.empty:
+        st.info(f"No route was run {routes.MIN_RUNS} or more times in this period. Routes are "
+                f"matched from the GPS tracks, so try a longer period in the sidebar.")
+        return
+    st.markdown(
+        f"**{len(table)} routes** you ran at least {routes.MIN_RUNS} times in this period, "
+        f"most run first. Pick one to see the run where you set its PR, painted by pace.")
+
+    labels = {f"{r.route_id}. {r.name} · {units.format_distance(r.distance_km)} {r.shape} · "
+              f"{r.runs} runs": r.route_id for r in table.itertuples()}
+    cols = st.columns([3, 1])
+    choice = cols[0].selectbox("Route", list(labels), key="route_pick")
+    basemap = cols[1].toggle(
+        "Street map", key="routes_basemap",
+        help="Draws the routes on CARTO / OpenStreetMap tiles, which your browser downloads "
+             "-- telling CARTO roughly where you run. Off, nothing goes over the network.")
+    route_id = labels[choice]
+    row = table.set_index("route_id").loc[route_id]
+
+    st.plotly_chart(plots.routes_overview_figure(table, tracks, units, basemap, route_id),
+                    width="stretch", key="routes_overview")
+
+    cards = st.columns(5)
+    cards[0].metric("Runs on this route", f"{row['runs']:,}")
+    cards[1].metric("Route PR", format_duration(row["pr_time_s"]),
+                    help="The fastest average pace on this route, carried over the route's "
+                         "typical distance, so a run a few hundred metres longer is not "
+                         "penalised for the extra.")
+    cards[2].metric("PR pace", units.format_pace(row["pr_pace_min_per_km"]))
+    cards[3].metric("Typical pace", units.format_pace(row["median_pace_min_per_km"]),
+                    help="Your median pace across every run on this route in the period.")
+    cards[4].metric("PR set on", f"{row['pr_date']:%d %b %Y}")
+
+    pr_run = activities.set_index("activity_id").loc[row["pr_id"]]
+    st.subheader(f"The PR run: {pr_run['name']}, {row['pr_date']:%d %b %Y}")
+    route = streams.route_for(int(row["pr_id"]), data["all_activities"], path)
+    if route.empty:
+        st.caption("The PR run's GPS track could not be read, so there is no heat map for it.")
+    else:
+        pace_heat_map(route, units, basemap, key="route_pr_heat")
+
+    efforts = routes.route_efforts(groups, activities, route_id)
+    st.plotly_chart(plots.route_history_figure(efforts, units), width="stretch",
+                    key="route_history")
+    st.caption(
+        f"Runs are matched from their GPS tracks: the same start and finish (within "
+        f"{routes.MAX_ENDPOINT_M:.0f} m), a distance within {routes.MAX_LENGTH_DIFF:.0%}, and "
+        f"tracks that stay within about {routes.MAX_MEAN_GAP_M:.0f} m of each other the whole "
+        f"way, so a detour makes it a different route. A loop run the other way round counts "
+        f"as the same route. A route is named after the title you gave most of its runs, if "
+        f"you did. The step line is the route PR as it stood at each run.")
+
+    st.dataframe(pd.DataFrame({
+        "Route": [f"{r.route_id}. {r.name}" for r in table.itertuples()],
+        "Distance": table["distance_km"].map(units.format_distance),
+        "Shape": table["shape"],
+        "Runs": table["runs"],
+        "PR": table["pr_time_s"].map(format_duration),
+        "PR pace": table["pr_pace_min_per_km"].map(units.format_pace),
+        "PR date": table["pr_date"].dt.strftime("%d %b %Y"),
+        "Last run": table["last_date"].dt.strftime("%d %b %Y"),
+    }), hide_index=True, width="stretch")
 
 
 def gear_tab(data: dict) -> None:
@@ -1049,13 +1138,16 @@ def main() -> None:
     data["near_pr"] = near_pr_table(all_streams.best if has_gps
                                     else whole_run_efforts(all_activities))
 
-    overview, run_detail, efforts, fitness, heart_rate, gear = st.tabs(
-        ["Overview", "Activities", "Best efforts", "Fitness & Freshness", "Heart rate", "Gear"]
+    overview, run_detail, route_tab, efforts, fitness, heart_rate, gear = st.tabs(
+        ["Overview", "Activities", "Routes", "Best efforts", "Fitness & Freshness",
+         "Heart rate", "Gear"]
     )
     with overview:
         overview_tab(data)
     with run_detail:
         run_detail_tab(data, stream_data, path)
+    with route_tab:
+        routes_tab(data, stream_data, path)
     with efforts:
         best_efforts_tab(data, stream_data)
     with fitness:

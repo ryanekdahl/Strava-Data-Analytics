@@ -34,6 +34,7 @@ AXIS = "#c3c2b7"
 SERIES = {"fitness": "#2a78d6", "fatigue": "#eb6834", "form": "#1baf7a"}
 GOOD = "#0ca30c"
 FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
+_EARTH_M_PER_DEG = 6_371_008.8 * np.pi / 180.0
 
 
 def _base(
@@ -693,6 +694,54 @@ def _segment_path(segs: pd.DataFrame) -> tuple[list, list]:
     return lats, lons
 
 
+RETRACE_SHARE = 0.15   # this much of a route doubling back on itself gets keep-right lanes
+LANE_PX = 5.0          # how far each direction is pushed off the centre line, in pixels
+
+
+def _retraced_share(east: np.ndarray, north: np.ndarray, near_m: float = 40.0,
+                    apart_m: float = 400.0) -> float:
+    """Share of points with a point at least ``apart_m`` further along within ``near_m``."""
+    along = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(east), np.diff(north)))])
+    step = max(len(east) // 150, 1)  # thin long tracks; the share barely changes
+    e, n, a = east[::step], north[::step], along[::step]
+    d = np.hypot(e[:, None] - e[None, :], n[:, None] - n[None, :])
+    far_along = np.abs(a[:, None] - a[None, :]) >= apart_m
+    return float(((d <= near_m) & far_along).any(axis=1).mean())
+
+
+def _keep_right(segs: pd.DataFrame, lat_mid: float, plot_px: float = 460.0) -> pd.DataFrame:
+    """Shift a route that doubles back to the right of its direction of travel.
+
+    On an out-and-back the way home is drawn over the way out, hiding half the
+    run.  Pushing every point a few pixels to its right (at the map's scale)
+    splits the two directions into side-by-side lanes, like traffic.  Routes
+    that never double back are returned untouched, so they stay on the road.
+    """
+    if len(segs) < 3:
+        return segs
+    k = _EARTH_M_PER_DEG
+    cos = np.cos(np.radians(lat_mid))
+    lat = np.append(segs["lat0"].to_numpy(), segs["lat1"].iloc[-1])
+    lon = np.append(segs["lon0"].to_numpy(), segs["lon1"].iloc[-1])
+    east, north = lon * k * cos, lat * k
+    if _retraced_share(east, north) < RETRACE_SHARE:
+        return segs
+    span = max(float(np.ptp(east)), float(np.ptp(north)), 1.0)
+    offset = LANE_PX * span / plot_px
+    # Direction at each point from a few points either side, so GPS jitter cannot flip it.
+    w = 3
+    pe, pn = np.pad(east, w, mode="edge"), np.pad(north, w, mode="edge")
+    de, dn = pe[2 * w:] - pe[:-2 * w], pn[2 * w:] - pn[:-2 * w]
+    length = np.hypot(de, dn)
+    length[length == 0] = 1.0
+    east = east + offset * dn / length   # (dn, -de) points to the right of travel
+    north = north - offset * de / length
+    out = segs.copy()
+    out["lat0"], out["lat1"] = north[:-1] / k, north[1:] / k
+    out["lon0"], out["lon1"] = east[:-1] / (k * cos), east[1:] / (k * cos)
+    return out
+
+
 def pace_heatmap_figure(heat, extremes: pd.DataFrame, units: Units = METRIC,
                         basemap: bool = False) -> go.Figure:
     """The route painted by pace: hot where you were fast, cool where you eased off.
@@ -714,6 +763,7 @@ def pace_heatmap_figure(heat, extremes: pd.DataFrame, units: Units = METRIC,
     segs, bands = heat.segments, heat.bands
     colors = _band_colors(len(bands))
     lat_mid = float(np.nanmean(np.concatenate([segs["lat0"], segs["lat1"]])))
+    segs = _keep_right(segs, lat_mid)
     lon_mid = float(np.nanmean(np.concatenate([segs["lon0"], segs["lon1"]])))
 
     fig = make_subplots(
@@ -761,8 +811,13 @@ def pace_heatmap_figure(heat, extremes: pd.DataFrame, units: Units = METRIC,
     # Start / finish, then the fastest and slowest split, labelled in place.
     ends_lat = [segs["lat0"].iloc[0], segs["lat1"].iloc[-1]]
     ends_lon = [segs["lon0"].iloc[0], segs["lon1"].iloc[-1]]
+    ends_text = ["Start", "Finish"]
+    apart_m = np.hypot((ends_lat[1] - ends_lat[0]) * _EARTH_M_PER_DEG,
+                       (ends_lon[1] - ends_lon[0]) * _EARTH_M_PER_DEG * np.cos(np.radians(lat_mid)))
+    if apart_m < 100.0:  # a loop or an out-and-back: one marker, one label
+        ends_lat, ends_lon, ends_text = ends_lat[:1], ends_lon[:1], ["Start / Finish"]
     fig.add_trace(point(**where(ends_lat, ends_lon), mode="markers+text",
-                        text=["Start", "Finish"], textposition="top right",
+                        text=ends_text, textposition="top right",
                         textfont=dict(color=INK, size=12), hoverinfo="skip",
                         marker=dict(color=INK, size=10)), row=1, col=1)
     if not extremes.empty:
@@ -837,6 +892,116 @@ def pace_heatmap_figure(heat, extremes: pd.DataFrame, units: Units = METRIC,
         fig.update_xaxes(visible=False, row=1, col=1)
         fig.update_yaxes(visible=False, scaleanchor="x",
                          scaleratio=1.0 / np.cos(np.radians(lat_mid)), row=1, col=1)
+    return fig
+
+
+# --------------------------------------------------------------------------
+# Most frequent routes
+# --------------------------------------------------------------------------
+
+# The validated categorical order; a route keeps its colour (by route number) in any period.
+ROUTE_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300",
+                "#6250d6", "#e34948")
+
+
+def route_color(route_id: int) -> str:
+    """Routes 1-8 get the categorical hues in order; later ones are drawn muted."""
+    return ROUTE_COLORS[route_id - 1] if 1 <= route_id <= len(ROUTE_COLORS) else MUTED
+
+
+def routes_overview_figure(table: pd.DataFrame, tracks: dict, units: Units = METRIC,
+                           basemap: bool = False, selected: int | None = None) -> go.Figure:
+    """Every frequent route on one map, coloured and numbered, the selected one on top.
+
+    ``table`` is :func:`src.routes.route_table`; each route is drawn from its
+    reference run's track in ``tracks``.  The number sits at the route's
+    farthest point from the start, where the routes fan out, so labels rarely
+    overlap.  The selected route is drawn thicker and the others fade back.
+    """
+    point = go.Scattermap if basemap else go.Scatter
+
+    def where(lats, lons) -> dict:
+        return dict(lat=lats, lon=lons) if basemap else dict(x=lons, y=lats)
+
+    fig = go.Figure()
+    order = sorted(table.itertuples(), key=lambda r: r.route_id == selected)  # selected last
+    all_lat, all_lon = [], []
+    for r in order:
+        track = tracks.get(r.reference_id)
+        if track is None or track.empty:
+            continue
+        lat, lon = track["lat"].to_numpy(), track["lon"].to_numpy()
+        all_lat.append(lat)
+        all_lon.append(lon)
+        chosen = selected is None or r.route_id == selected
+        label = (f"<b>{r.route_id}. {r.name}</b><br>{units.format_distance(r.distance_km)} "
+                 f"{r.shape} · {r.runs} runs")
+        fig.add_trace(point(**where(lat, lon), mode="lines", name=f"{r.route_id}. {r.name}",
+                            legendrank=r.route_id,
+                            line=dict(color=route_color(r.route_id), width=5 if chosen else 3),
+                            opacity=1.0 if chosen else 0.35, text=label, hoverinfo="text"))
+        far = int(np.argmax((lat - lat[0]) ** 2 + ((lon - lon[0]) * np.cos(np.radians(lat[0]))) ** 2))
+        fig.add_trace(point(**where([lat[far]], [lon[far]]), mode="markers+text",
+                            text=[f"<b>{r.route_id}</b>"], textposition="middle center",
+                            textfont=dict(color=INK, size=11),
+                            marker=dict(size=20, color=route_color(r.route_id),
+                                        opacity=1.0 if chosen else 0.5),
+                            hovertext=label, hoverinfo="text", showlegend=False))
+    fig.update_layout(title="Your most frequent routes", hovermode="closest",
+                      legend=dict(orientation="h", y=-0.02, yanchor="top", x=0))
+    _base(fig, height=480)
+    fig.update_layout(margin=dict(l=8, r=8, t=48, b=8),
+                      legend=dict(orientation="h", y=-0.02, yanchor="top", x=0))
+    if not all_lat:
+        return fig
+    lats, lons = pd.Series(np.concatenate(all_lat)), pd.Series(np.concatenate(all_lon))
+    if basemap:
+        fig.update_layout(map=dict(style="carto-positron", zoom=_route_zoom(lats, lons, 640, 400),
+                                   center=dict(lat=float(lats.mean()), lon=float(lons.mean()))))
+    else:
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False, scaleanchor="x",
+                         scaleratio=1.0 / np.cos(np.radians(float(lats.mean()))))
+    return fig
+
+
+def route_history_figure(efforts: pd.DataFrame, units: Units = METRIC) -> go.Figure:
+    """Every run on one route: its pace by date, the PR as it stood, and the PR itself.
+
+    ``efforts`` is :func:`src.routes.route_efforts`.  The step line is the
+    route PR at each point in time, so each drop is a new PR; the all-time PR
+    is ringed and labelled.
+    """
+    pace = units.pace(efforts["pace_min_per_km"])
+    best = units.pace(efforts["best_so_far"])
+    hover = [f"<b>{units.format_pace(p)}</b><br>{format_duration(t)} for "
+             f"{units.format_distance(d, 2)}<br>{dt:%d %b %Y} · {n}"
+             for p, t, d, dt, n in zip(efforts["pace_min_per_km"], efforts["moving_time_s"],
+                                       efforts["distance_km"], efforts["date"], efforts["name"])]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=efforts["date"], y=best, mode="lines", name="Route PR at the time",
+                             line=dict(color=INK_SECONDARY, width=1.5, shape="hv"),
+                             hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=efforts["date"], y=pace, mode="markers", name="Run",
+                             marker=dict(color=SERIES["fitness"], size=9,
+                                         line=dict(width=2, color=SURFACE)),
+                             text=hover, hovertemplate="%{text}<extra></extra>"))
+    pr = efforts[efforts["is_pr"]]
+    if not pr.empty:
+        p = pr.iloc[0]
+        y = units.pace(p["pace_min_per_km"])
+        fig.add_trace(go.Scatter(
+            x=[p["date"]], y=[y], mode="markers",
+            marker=dict(size=16, color="rgba(0,0,0,0)", line=dict(width=2.5, color=INK)),
+            hoverinfo="skip", showlegend=False))
+        # A callout below-left, on a surface chip, so neighbouring runs cannot cover it.
+        fig.add_annotation(x=p["date"], y=y, ax=-44, ay=34, showarrow=True, arrowwidth=1,
+                           arrowcolor=INK_SECONDARY, bgcolor=SURFACE, borderpad=2,
+                           text=f"<b>PR</b> {format_pace(y, suffix='')} · {p['date']:%d %b %Y}",
+                           font=dict(color=INK, size=12))
+    fig.update_layout(title="Every run on this route", hovermode="closest")
+    _base(fig, height=340, y_title=units.pace_label)
+    _pace_axis(fig, pd.concat([pace, best]))
     return fig
 
 

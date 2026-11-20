@@ -23,6 +23,9 @@ What the simulation models
   42-day one, so a big week makes the next runs slower at the same heart rate,
   while steady training costs nothing.  This is the fatigue term
   that :mod:`src.personal_models` tries to recover.
+* **Regular routes**: four fixed courses from the same start (6 and 7.5 km
+  loops, a 10 km out-and-back, a 21 km loop), which most runs of about that
+  distance follow, with a few metres of GPS jitter; other runs wander.
 * **The columns recent exports carry**: max heart rate, cadence (per leg, as
   Strava writes it), grade-adjusted distance, Relative Effort, the shoe each run
   was logged in, and the ``Filename`` of its GPS recording.
@@ -117,6 +120,15 @@ CROSS_TRAINING = {  # sport: (chance in a training week, chance in a gap week)
 STREAM_SAMPLE_S = 5.0  # seconds between GPS points, like a watch's smart recording
 START_LAT, START_LON = 51.5007, -0.1246
 METERS_PER_DEGREE = 6_371_008.8 * math.pi / 180.0  # same sphere the haversine uses
+
+# Regular routes, so the Routes tab has repeats to find: (length km, shape).  A run
+# whose distance is within HOME_ROUTE_TOLERANCE of one usually follows it.
+HOME_ROUTES = ((6.0, "loop"), (7.5, "loop"), (10.0, "out_and_back"), (21.0, "loop"))
+HOME_ROUTE_TOLERANCE = 0.07
+HOME_ROUTE_SHARE = 0.75
+# Bump when the GPS recordings change, so an existing sample is regenerated.
+STREAMS_VERSION = "2"
+STREAMS_VERSION_FILE = ".streams-version"
 
 
 def _week_plan(week: int, rng: np.random.Generator) -> list[str]:
@@ -393,7 +405,15 @@ def sample_is_current(path: str | Path = SAMPLE_CSV) -> bool:
             header = handle.readline().strip()
     except OSError:
         return False
-    return header == ",".join(CSV_COLUMNS)
+    if header != ",".join(CSV_COLUMNS):
+        return False
+    marker = Path(path).parent / "activities" / STREAMS_VERSION_FILE
+    if not marker.parent.is_dir():
+        return True  # written without GPS recordings: nothing to be out of date
+    try:
+        return marker.read_text().strip() == STREAMS_VERSION
+    except OSError:
+        return False
 
 
 def generate_sample(
@@ -413,6 +433,7 @@ def generate_sample(
     # The final training week can spill past today; a real export never does.
     frame = frame[frame["Activity Date"] <= pd.Timestamp(end_date) + pd.Timedelta(days=1)]
     frame = frame.sort_values("Activity Date").reset_index(drop=True)
+    frame = _assign_home_routes(frame, seed)
     extras = ["Max Heart Rate", "Relative Effort", "Activity Gear", "Filename",
               "Average Cadence", "Grade Adjusted Distance", "Average Watts",
               "Weighted Average Power"]
@@ -539,8 +560,108 @@ def _speed_profile(run_type: str, distance_km: float, aux: np.random.Generator):
     return wobble
 
 
-def _simulate(row: pd.Series, aux: np.random.Generator) -> dict[str, np.ndarray]:
-    """Time, position, elevation, heart rate and cadence samples for one run."""
+def _home_route_path(length_m: float, shape: str,
+                     rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """A fixed route from the start: east and north offsets in metres, densely sampled.
+
+    A loop is a wobbly closed curve through the start; an out-and-back wanders
+    out for half the length and retraces its steps.
+    """
+    if shape == "loop":
+        theta = np.linspace(0.0, 2 * math.pi, 4000)
+        a, b = rng.uniform(0.08, 0.2, 2)
+        r = 1.0 + a * np.sin(2 * theta + rng.uniform(0, 2 * math.pi)) \
+            + b * np.sin(3 * theta + rng.uniform(0, 2 * math.pi))
+        x, y = r * np.cos(theta), r * np.sin(theta) * rng.uniform(0.6, 1.0)
+        turn = rng.uniform(0, 2 * math.pi)
+        x, y = x * math.cos(turn) - y * math.sin(turn), x * math.sin(turn) + y * math.cos(turn)
+        x, y = x - x[0], y - y[0]  # the loop starts and ends at the start
+    else:
+        steps = 2000
+        heading = rng.uniform(0, 2 * math.pi) + np.cumsum(rng.normal(0.0, 0.02, steps))
+        x = np.concatenate([[0.0], np.cumsum(np.sin(heading))])
+        y = np.concatenate([[0.0], np.cumsum(np.cos(heading))])
+        x, y = np.concatenate([x, x[-2::-1]]), np.concatenate([y, y[-2::-1]])
+    scale = length_m / float(np.sum(np.hypot(np.diff(x), np.diff(y))))
+    return x * scale, y * scale
+
+
+def _home_routes(seed: int) -> list[tuple[float, np.ndarray, np.ndarray]]:
+    """``(length_m, east_m, north_m)`` for each of :data:`HOME_ROUTES`, fixed per seed."""
+    rng = np.random.default_rng([seed, 99])
+    return [(km * 1000.0, *_home_route_path(km * 1000.0, shape, rng))
+            for km, shape in HOME_ROUTES]
+
+
+def _pick_home_route(distance_m: float, rng: np.random.Generator) -> int:
+    """Index into :data:`HOME_ROUTES` of the route this run follows, or -1 to wander."""
+    for index, (km, _) in enumerate(HOME_ROUTES):
+        if abs(distance_m - km * 1000.0) <= HOME_ROUTE_TOLERANCE * km * 1000.0:
+            return index if rng.random() < HOME_ROUTE_SHARE else -1
+    return -1
+
+
+def _assign_home_routes(frame: pd.DataFrame, seed: int) -> pd.DataFrame:
+    """Put runs of about a home route's length on it, in the hidden ``_home`` column.
+
+    A run on a fixed route records nearly the same distance every time, so its
+    distance is snapped to the route's length (within half a percent of GPS
+    noise) and its times and grade-adjusted distance are scaled to match,
+    keeping the pace it was run at.  Done from a per-run RNG, so nothing else
+    in the sample moves.
+    """
+    frame = frame.copy()
+    frame["_home"] = -1
+    runs = frame.index[(frame["Activity Type"] == "Run")
+                       & (pd.to_numeric(frame["Distance"], errors="coerce") > 0)]
+    for i in runs:
+        rng = np.random.default_rng([seed, int(frame.at[i, "Activity ID"]), 2])
+        home = _pick_home_route(float(frame.at[i, "Distance"]), rng)
+        if home < 0:
+            continue
+        target = HOME_ROUTES[home][0] * 1000.0 * (1.0 + rng.normal(0.0, 0.005))
+        factor = target / float(frame.at[i, "Distance"])
+        frame.at[i, "_home"] = home
+        frame.at[i, "Distance"] = round(target, 1)
+        for column in ("Moving Time", "Elapsed Time"):
+            frame.at[i, column] = int(round(float(frame.at[i, column]) * factor))
+        gad = pd.to_numeric(frame.at[i, "Grade Adjusted Distance"], errors="coerce")
+        if pd.notna(gad):
+            frame.at[i, "Grade Adjusted Distance"] = round(float(gad) * factor, 1)
+    return frame
+
+
+def _trace(path: tuple[np.ndarray, np.ndarray], fraction: np.ndarray, distance_m: float,
+           aux: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """Positions ``fraction`` of the way along ``path``, with GPS-like wander.
+
+    The wander is a slow drift of a few metres plus a little jitter, and the
+    track is then scaled about the start so its measured length is exactly
+    ``distance_m`` -- the recording must agree with the CSV's distance.
+    """
+    east, north = path
+    along = np.concatenate([[0.0], np.cumsum(np.hypot(np.diff(east), np.diff(north)))])
+    at = np.clip(fraction, 0.0, 1.0) * along[-1]
+    wobble = [sum(4.0 * np.sin(2 * math.pi * at / aux.uniform(1200, 3000) + aux.uniform(0, 7))
+                  for _ in range(2)) for _ in range(2)]
+    e = np.interp(at, along, east) + wobble[0] + aux.normal(0.0, 1.0, len(at))
+    n = np.interp(at, along, north) + wobble[1] + aux.normal(0.0, 1.0, len(at))
+    e, n = e - e[0], n - n[0]
+    measured = float(np.sum(np.hypot(np.diff(e), np.diff(n))))
+    if measured > 0:
+        e, n = e * distance_m / measured, n * distance_m / measured
+    lat = START_LAT + n / METERS_PER_DEGREE
+    lon = START_LON + e / (METERS_PER_DEGREE * np.cos(np.radians(lat)))
+    return lat, lon
+
+
+def _simulate(row: pd.Series, aux: np.random.Generator,
+              home: tuple[np.ndarray, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+    """Time, position, elevation, heart rate and cadence samples for one run.
+
+    With ``home`` (a path from :func:`_home_routes`) the run follows that route
+    instead of wandering.
+    """
     distance_m = float(row["Distance"])
     moving_s = float(row["Moving Time"])
     distance_km = distance_m / 1000.0
@@ -587,6 +708,8 @@ def _simulate(row: pd.Series, aux: np.random.Generator) -> dict[str, np.ndarray]
     lat = START_LAT + np.cumsum(step * np.cos(heading)) / METERS_PER_DEGREE
     lon = START_LON + np.cumsum(step * np.sin(heading)) / (
         METERS_PER_DEGREE * np.cos(np.radians(lat)))
+    if home is not None:
+        lat, lon = _trace(home, x_arr / distance_m, distance_m, aux)
 
     # Heart rate chases a pace-driven target with a ~25 s lag, then is shifted
     # so its time-weighted mean is exactly the CSV's average heart rate.
@@ -640,15 +763,18 @@ def _write_streams(frame: pd.DataFrame, out_dir: Path, seed: int) -> None:
     """Write ``activities/<id>.gpx.gz`` for every run that names one."""
     runs = frame[(frame["Activity Type"] == "Run") & (frame["Filename"] != "")]
     (out_dir / "activities").mkdir(parents=True, exist_ok=True)
+    routes = _home_routes(seed)
     for _, row in runs.iterrows():
         if float(row["Distance"]) <= 0:
             continue
         # A different stream from the CSV extras' RNG, but just as reproducible.
         aux = np.random.default_rng([seed, int(row["Activity ID"]), 1])
-        samples = _simulate(row, aux)
+        home = routes[int(row["_home"])][1:] if int(row.get("_home", -1)) >= 0 else None
+        samples = _simulate(row, aux, home)
         text = _gpx(row["Activity Date"].to_pydatetime(), row["Activity Name"], samples)
         path = out_dir / row["Filename"]
         path.write_bytes(gzip.compress(text.encode("utf-8"), compresslevel=6, mtime=0))
+    (out_dir / "activities" / STREAMS_VERSION_FILE).write_text(STREAMS_VERSION)
 
 
 def main() -> None:

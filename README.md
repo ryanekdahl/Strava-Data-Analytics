@@ -23,9 +23,9 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has six tabs, covering the stats Strava itself shows plus
+Python 3.11+. The dashboard has seven tabs, covering the stats Strava itself shows plus
 a Fitness & Freshness tab with workload management for serious runners: Overview,
-Activities, Best efforts, Fitness & Freshness, Heart rate and Gear. The sidebar has a
+Activities, Routes, Best efforts, Fitness & Freshness, Heart rate and Gear. The sidebar has a
 switch between the bundled sample data and your own export (uploaded as Strava's zip,
 or found in `data/raw/`), a **period** (all time, the last 12 / 6 / 3 months or 4 weeks,
 a calendar year, or a custom range), **kilometres or miles**, and your resting and max
@@ -37,12 +37,27 @@ heart rate.
 |---|---|
 | **Overview** | Total distance, runs, moving time and elevation gain (with the change from the previous period of the same length when a period is picked); current and longest weekly streak, typical and biggest week; weekly and monthly distance |
 | **Activities** | Any run, found by searching titles or narrowing by distance, with a **pace heat map** (the route painted red where you ran faster than that run's median and blue where you ran slower, beside how much of the distance fell in each pace band, a strip of the same colours along the distance, and the fastest and slowest split labelled on the map), the route by heart rate, and an animated **replay** (a dot crossing the route on the run's own clock, pace filling in below, each km or mile marked with its split); distance, time, pace, grade-adjusted pace, heart rate and cadence; its elevation, pace and heart rate stacked on one distance axis with climbs and descents shaded; per-kilometre (or per-mile) splits |
+| **Routes** | Your most frequent routes, found from the GPS tracks (no segments to draw), on one map; for each, the **pace heat map of the run that set its PR**, the PR time and pace against your typical pace there, and every run on the route by date with the PR progression |
 | **Best efforts** | **PR watch**: your best of the last 90 days at each distance against your all-time record, flagging the PRs within reach (≤3% off) and the even pace that would break them, plus a teaser on the Overview; true in-run best efforts from the GPS files (or whole-run PRs without them), Riegel race predictions from current form, and a race-time calculator |
 | **Fitness & Freshness** | Fitness, Fatigue and Form (CTL / ATL / TSB) over time with today's reading, the acute:chronic workload ratio against its sweet-spot band, and the exact load formula behind both. Rides, swims and other sessions count toward the load |
 | **Heart rate** | Share of time in zones Z1–Z5 (second by second when the GPS files are present), monthly hours by zone, and each zone's bpm range |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 
 ## Methodology
+
+### Most frequent routes — `src/routes.py`
+Each run's track is resampled to 60 points evenly spaced by distance. Two runs
+share a route when their distances differ by at most 8%, their starts and
+finishes are each within 250 m, and each track stays on average within 60 m of
+the other (90% of points within 150 m), so a detour of a few hundred metres makes
+it a different route. Matching is not transitive, so runs are not chained: the run
+matching the most others becomes a route's reference, it and its matches form the
+route, and the step repeats on what is left. Routes run at least 3 times are kept.
+The route PR is the fastest average pace (so a slightly longer run is not
+penalised), shown as a time over the route's median distance. A route takes the
+title used on a third of its runs unless that is a Strava default ("Morning Run").
+On the heat map, a route that doubles back (an out-and-back) is drawn with each
+direction pushed a few pixels to its right, so the way home does not hide the way out.
 
 ### Pace heat map — `src/pace_heat.py`
 Each stretch of the route (a pair of consecutive GPS points, using the smoothed

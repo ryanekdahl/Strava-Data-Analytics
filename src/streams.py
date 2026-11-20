@@ -835,6 +835,26 @@ def load_stream_data(activities: pd.DataFrame, export_csv: str | Path) -> Stream
     return StreamData(best, hr_seconds, gap_seconds, splits, mile_splits, runs, status)
 
 
+def cached_tracks(activities: pd.DataFrame, export_csv: str | Path) -> dict[int, pd.DataFrame]:
+    """Every run's cached, thinned track: ``{activity_id: DataFrame[lat, lon, distance_m]}``.
+
+    For comparing routes across runs.  Runs with no cached positions are left out.
+    """
+    cache_dir = cache_dir_for(export_csv)
+    tracks = {}
+    for activity_id, path in stream_files(activities, export_csv):
+        if not path.is_file():
+            continue
+        cached = _read_cache(cache_dir, activity_id, path)
+        route = (cached or {}).get("route") or {}
+        if len(route.get("lat") or []) < 2:
+            continue
+        tracks[activity_id] = pd.DataFrame(
+            {column: route[column] for column in ("lat", "lon", "distance_m")}
+        ).astype("float64")
+    return tracks
+
+
 def restrict(data: StreamData, activity_ids) -> StreamData:
     """The same stream data, keeping only the given runs (``status`` is unchanged)."""
     ids = set(int(i) for i in activity_ids)
