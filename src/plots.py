@@ -1397,8 +1397,12 @@ def athlete_color(index: int) -> str:
 
 
 def athlete_lines_figure(frame: pd.DataFrame, names: list[str], y: str, title: str,
-                         y_title: str, hover_fmt: str, scale: float = 1.0) -> go.Figure:
-    """One line per athlete from a long ``DataFrame[date, athlete, <y>]``, labelled at the end."""
+                         y_title: str, hover_fmt: str, scale: float = 1.0,
+                         x_title: str = "") -> go.Figure:
+    """One line per athlete from a long ``DataFrame[date, athlete, <y>]``, labelled at the end.
+
+    ``date`` may also hold day numbers; pass ``x_title`` to say so.
+    """
     fig = go.Figure()
     entries = []
     for index, name in enumerate(names):
@@ -1415,12 +1419,16 @@ def athlete_lines_figure(frame: pd.DataFrame, names: list[str], y: str, title: s
     span = float((frame[y] * scale).max() - (frame[y] * scale).min()) if not frame.empty else 0.0
     _gutter_labels(fig, entries, span)
     fig.update_layout(title=title)
-    return _base(fig, height=380, y_title=y_title, right=120)
+    return _base(fig, height=380, y_title=y_title, x_title=x_title, right=120)
 
 
 def weekly_battle_figure(battles: pd.DataFrame, names: list[str], title: str, y_title: str,
-                         hover_fmt: str, suffix: str = "", scale: float = 1.0) -> go.Figure:
-    """One weekly total per athlete, bars side by side; ``scale`` converts to display units."""
+                         hover_fmt: str, suffix: str = "", scale: float = 1.0,
+                         dated: bool = True) -> go.Figure:
+    """One weekly total per athlete, bars side by side; ``scale`` converts to display units.
+
+    ``week_start`` holds Monday dates, or week numbers when ``dated`` is false.
+    """
     fig = go.Figure()
     for index, name in enumerate(names):
         fig.add_trace(go.Bar(
@@ -1429,8 +1437,10 @@ def weekly_battle_figure(battles: pd.DataFrame, names: list[str], title: str, y_
             hovertemplate=f"{name}: %{{y:{hover_fmt}}}{suffix}<extra></extra>",
         ))
     fig.update_layout(title=title, barmode="group", bargap=0.2, bargroupgap=0.05)
-    fig.update_xaxes(hoverformat="Week of %d %b %Y")
-    return _base(fig, height=360, y_title=y_title)
+    if dated:
+        fig.update_xaxes(hoverformat="Week of %d %b %Y")
+        return _base(fig, height=360, y_title=y_title)
+    return _base(fig, height=360, y_title=y_title, x_title="Week of the period")
 
 
 def shared_runs_figure(shared: pd.DataFrame, you: str, friend: str,

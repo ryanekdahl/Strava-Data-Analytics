@@ -16,7 +16,9 @@ import pytest
 pytest.importorskip("streamlit.testing.v1")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
-from src.generate_sample import generate_sample, sample_is_current  # noqa: E402
+from src.generate_sample import (  # noqa: E402
+    friends_are_current, generate_friends, generate_sample, sample_is_current,
+)
 from src.loader import SAMPLE_CSV  # noqa: E402
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
@@ -79,3 +81,51 @@ def test_a_bad_upload_explains_itself():
     _assert_clean(at)
     assert any("not a valid zip" in error.value for error in at.error)
     assert at.radio(key="data_source").value == "Sample data (synthetic)"
+
+
+def test_compare_two_uploaded_exports():
+    if not friends_are_current(SAMPLE_CSV):
+        generate_friends(SAMPLE_CSV)
+    friends = SAMPLE_CSV.parent / "friends"
+    alex = io.BytesIO()
+    with zipfile.ZipFile(alex, "w") as zf:
+        zf.writestr("export_7/activities.csv", (friends / "alex.csv").read_bytes())
+    at = AppTest.from_file(str(APP), default_timeout=TIMEOUT_S)
+    at.run()
+    assert any("Add an export on each side" in info.value for info in at.info)
+
+    _uploader(at, "compare_upload_a").set_value(("export_7.zip", alex.getvalue(),
+                                                 "application/zip"))
+    at.text_input(key="compare_name_a").set_value("Alex")
+    _uploader(at, "compare_upload_b").set_value(("sam.csv", (friends / "sam.csv").read_bytes(),
+                                                 "text/csv"))
+    at.text_input(key="compare_name_b").set_value("Sam")
+    at.run()
+    _assert_clean(at)
+    assert at.selectbox(key="compare_window").value == "Dates both cover"
+    assert {m.label for m in at.metric} >= {"Alex leads", "Sam leads"}
+    assert any("Runs together" in h.value for h in at.subheader)
+
+    at.selectbox(key="compare_window").set_value("Last 3 months").run()
+    _assert_clean(at)
+    at.segmented_control(key="compare_measure").set_value("elevation_m").run()
+    _assert_clean(at)
+    at.radio(key="units").set_value("Miles").run()
+    _assert_clean(at)
+
+    stored = Path(at.session_state["workspace"]) / "compare"
+    assert (stored / "a.csv").is_file() and (stored / "b.csv").is_file()
+    at.button(key="compare_clear").click()
+    at.run()
+    _assert_clean(at)
+    assert not (stored / "a.csv").exists() and not (stored / "b.csv").exists()
+    assert any("Add an export on each side" in info.value for info in at.info)
+
+
+def test_a_bad_comparison_upload_explains_itself():
+    at = AppTest.from_file(str(APP), default_timeout=TIMEOUT_S)
+    at.run()
+    _uploader(at, "compare_upload_a").set_value(("x.zip", b"not a zip", "application/zip"))
+    at.run()
+    _assert_clean(at)
+    assert any("not a valid zip" in error.value for error in at.error)

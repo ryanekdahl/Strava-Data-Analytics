@@ -573,23 +573,39 @@ in their own session folder, so nobody sees anyone else's data.
 └── tests/                      # pytest: loader contract, load model, predictions, workload
 ```
 
-### Head to head — `src/head_to_head.py`
+### Compare — `src/compare.py` and `src/head_to_head.py`
 
-Each friend is one more `activities.csv` (or their whole archive zip), uploaded on the
-tab (or, locally, dropped into `data/raw/friends/` as `<name>.csv` or
-`<name>/activities.csv`) and removable there too. With an uploaded export, friends
-are kept in the same session folder and deleted with it. It goes through the
-same loader and load model as yours. Everyone is measured over the sidebar's period,
-so a longer export does not win on history alone, and per-week rates sit beside the
-totals. Fitness is computed on each whole history and then cut, with the standard
-42/7-day constants for everyone and the default 60/190 bpm heart rates for friends,
-whose own are unknown. Because load is scored against each runner's *own* threshold
-pace, Fitness compares how hard each of you trains relative to your ability, not who
-is faster; the best-effort (whole-run, as friends' GPS files are not read) and Riegel
-prediction tables answer that. Two runs count as *together* when they start within
-15 minutes and their distances differ by at most 15%; both limits can be adjusted on the tab. The sample data ships two
-synthetic friends — Alex, quicker on less volume, and Sam, slower on more — who join
-some of the sample runner's long runs.
+The Compare tab takes two uploads, side by side: two Strava archive zips, or just
+their `activities.csv` files. They can be yours and a friend's, or two of your own
+from different years. Only each `activities.csv` is kept, in the session's private
+folder. **Clear comparison** (or **Remove my data**) deletes both files, and so does
+the usual few-hour purge. Both exports go through the same loader and load model as
+the main view.
+
+Two exports rarely cover the same dates, so the tab offers a choice of window:
+**Dates both cover** (the calendar overlap, offered only when there is one) measures
+both over exactly the same days. **Last N months / All time** counts back from *each
+export's own* latest run, so exports from different years compare over an equally
+long stretch. When the windows differ, the charts start each runner on day 1 (or
+week 1) of their own window, not on the calendar.
+
+The tab shows:
+
+- a scoreboard of totals and per-week rates
+- whole-run best efforts and Riegel predictions
+- running totals and weekly bars, by distance, time, elevation or runs
+- Fitness
+- runs done together
+
+Fitness is computed on each whole history and then cut. Both exports use the default
+60/190 bpm heart rates, because the sidebar's values belong to one runner. Load is
+scored against each runner's *own* threshold pace, so Fitness compares how hard each
+trains relative to their ability, not who is faster. The best-effort and prediction
+tables answer who is faster. Two runs count as *together* when they start within
+15 minutes and their distances differ by at most 15%. `python -m src.generate_sample`
+also writes two synthetic friends to `data/sample/friends/`, which are handy test
+uploads. Alex is quicker on less volume, Sam is slower on more, and both join some of
+the sample runner's long runs.
 
 ### The synthetic data
 

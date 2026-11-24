@@ -78,10 +78,10 @@ def test_run_replay_plays_on_both_backdrops(app):
         _assert_clean(app)
 
 
-def test_six_tabs(app):
+def test_tabs(app):
     assert [tab.label for tab in app.tabs] == [
         "Overview", "Activities", "Routes", "Best efforts", "Fitness & Freshness", "Heart rate",
-        "Gear"]
+        "Gear", "Compare"]
 
 
 def test_routes_tab_shows_the_pr_heat_map_for_each_route(app):

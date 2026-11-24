@@ -6,9 +6,10 @@ sidebar (unpacked into a private per-session temp folder, see ``src/upload.py``)
 when running locally you can instead drop ``activities.csv`` into ``data/raw/``
 and the sidebar offers it as another source.
 
-Six tabs: the stats Strava itself shows (Overview, Activities, Best efforts,
-Heart rate, Gear) plus Fitness & Freshness with the acute:chronic workload
-ratio for runners who manage their training load.
+Tabs for the stats Strava itself shows (Overview, Activities, Best efforts,
+Heart rate, Gear), Fitness & Freshness with the acute:chronic workload ratio
+for runners who manage their training load, and Compare, where two uploaded
+exports are measured side by side.
 
 If the export's ``activities/`` folder of GPS recordings sits next to the CSV,
 the app reads those too (once, then from a cache) for true in-run best efforts,
@@ -32,13 +33,17 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from src import pace_heat, plots, replay, routes, streams, terrain, upload
+from src import compare, pace_heat, plots, replay, routes, streams, terrain, upload
 from src.consistency import (
     SWEET_SPOT, acwr_status, compute_acwr, monthly_volume, summary_kpis,
     weekly_streaks, weekly_volume,
 )
 from src.gear import DEFAULT_RETIRE_KM, INACTIVE_DAYS, gear_summary, unassigned_share
 from src.generate_sample import generate_sample, sample_is_current
+from src.head_to_head import (
+    METRICS, RACE_MEASURES, SHARED_DISTANCE_TOLERANCE, SHARED_WINDOW_MIN, TIE, athlete_profile,
+    head_to_head_table, prediction_comparison, record_comparison, scoreboard, shared_runs,
+)
 from src.heart_rate import (
     hr_coverage, monthly_zone_hours, stream_monthly_zone_hours, stream_zone_distribution,
     zone_distribution,
@@ -244,8 +249,10 @@ def upload_export() -> Path | None:
         return None
     os.utime(csv_path.parents[1])  # keep an active session's folder from being purged
     if st.sidebar.button("Remove my data", key="remove_upload",
-                         help="Deletes your uploaded export and any friends you added, now."):
+                         help="Deletes your uploaded export and any exports on the Compare "
+                              "tab, now."):
         forget_upload()
+        clear_comparison()
         st.session_state["uploader_generation"] += 1
         st.rerun()
     return csv_path
@@ -1097,6 +1104,222 @@ def gear_tab(data: dict) -> None:
     }), hide_index=True, width="stretch")
 
 
+COMPARE_SLOTS = (("a", "Athlete 1"), ("b", "Athlete 2"))
+COMPARE_MEASURE_UNITS = {  # measure -> (scale from stored units, display suffix, hover format)
+    "hours": (1.0, " h", ",.1f"),
+    "runs": (1.0, "", ",.0f"),
+}
+
+
+def clear_comparison() -> None:
+    """Forget both Compare-tab exports, delete their files and reset the two uploaders."""
+    workspace = st.session_state.get("workspace")
+    if workspace is not None:
+        for slot, _ in COMPARE_SLOTS:
+            (Path(workspace) / "compare" / f"{slot}.csv").unlink(missing_ok=True)
+    for slot, _ in COMPARE_SLOTS:
+        st.session_state.pop(f"compare_{slot}", None)
+    st.session_state["compare_generation"] = st.session_state.get("compare_generation", 0) + 1
+
+
+def compare_upload(slot: str, default: str, box) -> tuple[str, Path] | None:
+    """One Compare-tab uploader and name; returns ``(name, activities.csv)`` once it is usable.
+
+    Only the export's ``activities.csv`` is kept (GPS files are skipped), in this
+    session's private folder.  The file is rewritten if that folder was replaced
+    meanwhile, e.g. by a new sidebar upload.
+    """
+    generation = st.session_state.get("compare_generation", 0)
+    file = box.file_uploader(
+        f"{default}'s Strava export", type=["zip", "csv"],
+        key=f"compare_upload_{slot}_{generation}",
+        help="The .zip Strava emails you, unchanged, or just its activities.csv.")
+    name = box.text_input("Name", value=default, key=f"compare_name_{slot}", max_chars=40)
+    state_key = f"compare_{slot}"
+    if file is None:
+        st.session_state.pop(state_key, None)
+        return None
+    upload_id = f"{file.file_id}:{file.name}:{file.size}"
+    stored = st.session_state.get(state_key)
+    if stored is not None and stored[0] == upload_id:
+        if stored[1] is None:
+            box.error(stored[2])
+            return None
+        if Path(stored[1]).is_file():
+            return name, Path(stored[1])
+
+    csv_path = session_workspace() / "compare" / f"{slot}.csv"
+    try:
+        with st.spinner(f"Reading {file.name}..."):
+            content = upload.read_export_csv(file.getvalue(), file.name)
+            csv_path.parent.mkdir(exist_ok=True)
+            csv_path.write_bytes(content)
+            runs = load_activities(csv_path)
+        problem = None if not runs.empty else "That export has no runs in it."
+    except (upload.ExportError, ValueError, KeyError, pd.errors.ParserError,
+            UnicodeDecodeError, OSError) as err:
+        problem = f"That file could not be read as a Strava export: {err}"
+    if problem is not None:
+        csv_path.unlink(missing_ok=True)
+        st.session_state[state_key] = (upload_id, None, problem)
+        box.error(problem)
+        return None
+    st.session_state[state_key] = (upload_id, str(csv_path), None)
+    return name, csv_path
+
+
+def format_metric(key: str, value: float, units: Units) -> str:
+    """One head-to-head metric in the display units."""
+    if pd.isna(value):
+        return "--"
+    return {
+        "distance_km": lambda: units.format_distance(value, 0),
+        "runs": lambda: f"{value:,.0f}",
+        "hours": lambda: f"{value:,.0f} h",
+        "elevation_m": lambda: f"{value * units.per_metre:,.0f} {units.elevation_label}",
+        "longest_km": lambda: units.format_distance(value, 1),
+        "weekly_km": lambda: units.format_distance(value, 1),
+        "active_share": lambda: f"{value:.0%}",
+        "longest_streak": lambda: f"{value:.0f} weeks",
+        "avg_pace": lambda: units.format_pace(value),
+        "fitness": lambda: f"{value:.0f}",
+    }[key]()
+
+
+def leader_text(leader: str | None) -> str:
+    return "--" if leader is None else "Tie" if leader == TIE else leader
+
+
+def compare_tab(units: Units) -> None:
+    """Two uploaded exports, measured over a fair window and shown side by side."""
+    st.markdown("Upload two Strava exports (yours and a friend's, or two of your own from "
+                "different years) to compare them side by side.")
+    cols = st.columns(2)
+    picked = [compare_upload(slot, default, col)
+              for (slot, default), col in zip(COMPARE_SLOTS, cols)]
+    if any(st.session_state.get(f"compare_{slot}") for slot, _ in COMPARE_SLOTS):
+        if st.button("Clear comparison", key="compare_clear",
+                     help="Deletes both uploaded exports from this tab, now."):
+            clear_comparison()
+            st.rerun()
+    if any(p is None for p in picked):
+        st.info("Add an export on each side to start the comparison. Each export is read "
+                "for its `activities.csv` only, so friends' GPS files and photos are skipped. "
+                "Both stay in your private session folder and are deleted with **Clear "
+                "comparison** or a few hours after you leave.", icon=":material/compare_arrows:")
+        return
+    os.utime(session_workspace())  # keep an active comparison from being purged
+
+    names = compare.distinct_names([name for name, _ in picked],
+                                   [default for _, default in COMPARE_SLOTS])
+    datasets = {name: build_analytics(str(path), path.stat().st_mtime,
+                                      DEFAULT_HR_REST, DEFAULT_HR_MAX)
+                for name, (_, path) in zip(names, picked)}
+    history = {name: data["activities"] for name, data in datasets.items()}
+
+    choices = compare.window_choices(history)
+    if st.session_state.get("compare_window") not in choices:
+        st.session_state["compare_window"] = choices[0]
+    choice = st.selectbox(
+        "Compare over", choices, key="compare_window",
+        help=f"\"{compare.SHARED_DATES}\" measures both over exactly the same days. The other "
+             "periods count back from each export's own latest run, so exports from "
+             "different years can still be compared on an equally long stretch.")
+    windows = compare.comparison_windows(history, choice)
+    aligned = compare.is_aligned(windows)
+    runs = compare.runs_in_windows(history, windows)
+    st.caption(" · ".join(
+        f"**{name}**: {start:%d %b %Y} to {end - pd.Timedelta(days=1):%d %b %Y}, "
+        f"{len(runs[name]):,} runs" for name, (start, end) in windows.items()))
+    empty = [name for name, frame in runs.items() if frame.empty]
+    if empty:
+        st.warning(f"{' and '.join(empty)} ran nothing in this window; pick another one.")
+        return
+
+    profiles = {name: athlete_profile(history[name], datasets[name]["fitness"], *windows[name])
+                for name in names}
+    table = head_to_head_table(profiles)
+    score = scoreboard(table, names)
+    cards = st.columns(len(names))
+    for card, name in zip(cards, names):
+        card.metric(f"{name} leads", f"{score[name]} of {len(METRICS)}",
+                    help="How many of the measures below this athlete is ahead on.")
+    st.dataframe(pd.DataFrame({
+        "Measure": table["label"],
+        **{name: [format_metric(key, value, units) for key, value in zip(table["metric"],
+                                                                          table[name])]
+           for name in names},
+        "Ahead": table["leader"].map(leader_text),
+    }), hide_index=True, width="stretch")
+    st.caption(
+        "Per-week rates and weeks with a run reward consistency, not just a longer window. "
+        "Fitness is scored against each runner's *own* threshold pace, so it says who is "
+        "training harder for themselves, not who is faster; the default heart rates "
+        f"({DEFAULT_HR_REST:.0f}/{DEFAULT_HR_MAX:.0f} bpm) are used for both.")
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Best efforts")
+        records = record_comparison(runs)
+        st.dataframe(pd.DataFrame({
+            "Distance": records["distance"],
+            **{name: records[name].map(lambda t: format_duration(t) if pd.notna(t) else "--")
+               for name in names},
+            "Ahead": [f"{leader_text(l)} by {format_gap(m)}" if pd.notna(m) and l != TIE
+                      else leader_text(l) for l, m in zip(records["leader"],
+                                                          records["margin_s"])],
+        }), hide_index=True, width="stretch")
+        st.caption("Fastest pace held over a whole run of at least each distance, carried "
+                   "over that distance. GPS files are not read on this tab.")
+    with right:
+        st.subheader("Race predictions")
+        predictions = prediction_comparison(runs)
+        st.dataframe(pd.DataFrame({
+            "Distance": predictions["distance"],
+            **{name: predictions[name].map(lambda t: format_duration(t) if pd.notna(t)
+                                           else "--") for name in names},
+            "Faster": predictions["leader"].map(leader_text),
+        }), hide_index=True, width="stretch")
+        st.caption(f"Riegel's model applied to each runner's best run of the last "
+                   f"{RECENT_WINDOW_DAYS} days in their window.")
+
+    measure = st.segmented_control(
+        "Compare totals by", list(RACE_MEASURES), default="distance_km",
+        format_func=RACE_MEASURES.get, key="compare_measure") or "distance_km"
+    label = RACE_MEASURES[measure]
+    scale, suffix, hover = COMPARE_MEASURE_UNITS.get(measure, (
+        (units.per_km, f" {units.distance_label}", ",.1f") if measure == "distance_km"
+        else (units.per_metre, f" {units.elevation_label}", ",.0f")))
+    y_title = label + (f" ({suffix.strip()})" if suffix else "")
+    totals = compare.cumulative(runs, windows, measure)
+    st.plotly_chart(plots.athlete_lines_figure(
+        totals, names, measure, f"{label}, running total", y_title, hover, scale,
+        x_title="" if aligned else "Day of the period"), width="stretch", key="compare_totals")
+    battles = compare.weekly(runs, windows, measure)
+    st.plotly_chart(plots.weekly_battle_figure(
+        battles, names, f"{label} per week", y_title, hover, suffix, scale, dated=aligned),
+        width="stretch", key="compare_weekly")
+    if not aligned:
+        st.caption("The two windows cover different dates, so both charts start each runner "
+                   "on day 1 of their own window.")
+
+    fitness = compare.fitness_lines({name: datasets[name]["fitness"] for name in names},
+                                    windows)
+    st.plotly_chart(plots.athlete_lines_figure(
+        fitness, names, "ctl", "Fitness (CTL)", "Fitness", ".0f",
+        x_title="" if aligned else "Day of the period"), width="stretch", key="compare_fitness")
+    st.caption(f"Fitness is each runner's {CTL_DAYS}-day average training load, built up "
+               "over their whole history before the window starts.")
+
+    together = shared_runs(runs[names[0]], runs[names[1]])
+    if not together.empty:
+        st.subheader(f"Runs together ({len(together)})")
+        st.plotly_chart(plots.shared_runs_figure(together, names[0], names[1], units),
+                        width="stretch", key="compare_together")
+        st.caption(f"Runs that started within {SHARED_WINDOW_MIN} minutes of each other and "
+                   f"differ in distance by at most {SHARED_DISTANCE_TOLERANCE:.0%}.")
+
+
 def main() -> None:
     path = choose_source()
     period_box = st.sidebar.container()  # filled once the runs are loaded
@@ -1138,9 +1361,9 @@ def main() -> None:
     data["near_pr"] = near_pr_table(all_streams.best if has_gps
                                     else whole_run_efforts(all_activities))
 
-    overview, run_detail, route_tab, efforts, fitness, heart_rate, gear = st.tabs(
+    overview, run_detail, route_tab, efforts, fitness, heart_rate, gear, compare_view = st.tabs(
         ["Overview", "Activities", "Routes", "Best efforts", "Fitness & Freshness",
-         "Heart rate", "Gear"]
+         "Heart rate", "Gear", "Compare"]
     )
     with overview:
         overview_tab(data)
@@ -1156,6 +1379,8 @@ def main() -> None:
         heart_rate_tab(data, stream_data)
     with gear:
         gear_tab(data)
+    with compare_view:
+        compare_tab(units)
 
 
 if __name__ == "__main__":
