@@ -71,6 +71,8 @@ def test_route_map_with_and_without_street_tiles(app):
 
 
 def test_run_replay_plays_on_both_backdrops(app):
+    app.toggle(key="replay_on").set_value(True).run()
+    _assert_clean(app)
     for basemap in (True, False):
         app.toggle(key="route_basemap").set_value(basemap).run()
         _assert_clean(app)

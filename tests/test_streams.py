@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import sqlite3
 import struct
 from datetime import datetime, timedelta, timezone
 
@@ -323,7 +324,7 @@ def test_a_disk_error_is_retried_not_cached_as_a_bad_file(tmp_path, monkeypatch)
 
     monkeypatch.setattr(streams, "read_stream", timeout)
     assert streams.cache_summary(1, source, tmp_path / "cache") is False
-    assert not list((tmp_path / "cache").glob("*.json")) if (tmp_path / "cache").exists() else True
+    assert not (tmp_path / "cache" / streams.CACHE_FILE).exists()
 
 
 def test_unreadable_and_missing_files_are_counted_not_fatal(tmp_path):
@@ -397,17 +398,23 @@ def test_route_for_reads_the_cached_track_with_a_plausible_pace(sample):
     assert streams.route_for(-1, runs, path).empty
 
 
-def test_reparsing_a_run_removes_its_stale_cache_files(sample, tmp_path):
+def test_the_cache_is_one_file_and_reparsing_replaces_a_runs_row(sample, tmp_path):
     path, runs = sample
     activity_id, source = streams.stream_files(runs, path)[0]
     cache_dir = tmp_path / "cache"
-    cache_dir.mkdir()
-    stale = cache_dir / f"v1-{activity_id}-123-456.json"
-    other = cache_dir / f"v1-{activity_id + 100000}-123-456.json"
-    stale.write_text("{}")
-    other.write_text("{}")
     assert streams.cache_summary(activity_id, source, cache_dir)
-    assert not stale.exists() and other.exists()
+    assert streams.cache_summary(activity_id, source, cache_dir)
+    assert [f.name for f in cache_dir.iterdir()] == [streams.CACHE_FILE]
+    with sqlite3.connect(cache_dir / streams.CACHE_FILE) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_exports_in_the_project_folder_cache_outside_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("STRAVA_DATA_DIR", str(tmp_path))
+    inside = streams.cache_dir_for(streams.PROJECT_ROOT / "data" / "raw" / "activities.csv")
+    assert tmp_path in inside.parents
+    elsewhere = tmp_path / "upload" / "export" / "activities.csv"
+    assert streams.cache_dir_for(elsewhere) == elsewhere.parent / streams.CACHE_DIR_NAME
 
 
 def test_pace_curve_is_monotone_in_time(sample):

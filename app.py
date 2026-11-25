@@ -136,8 +136,7 @@ def prepare_streams(path: Path, activities: pd.DataFrame) -> streams.StreamData 
 
 def stream_token(path: Path) -> int:
     """Changes whenever the GPS summary cache does, so cached views built on it refresh."""
-    cache_dir = streams.cache_dir_for(path)
-    return cache_dir.stat().st_mtime_ns if cache_dir.is_dir() else 0
+    return streams.cache_token(path)
 
 
 @st.cache_data(show_spinner="Finding your regular routes...", ttl=CACHE_TTL,
@@ -976,7 +975,9 @@ def route_replay(route: pd.DataFrame, units: Units) -> None:
     frames = replay.replay_frames(route)
     if frames.empty:
         return
-    with st.expander("▶ Replay this run", expanded=False):
+    # A toggle rather than an expander: Streamlit runs a collapsed expander's code
+    # anyway, and the animation frames are the slowest thing on the page.
+    if st.toggle("▶ Replay this run", key="replay_on"):
         length = st.segmented_control(
             "Replay length", list(REPLAY_LENGTHS), default="20 s", key="replay_length",
             help="How long the whole run takes to play back. The dot keeps the run's own "

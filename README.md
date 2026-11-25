@@ -18,7 +18,7 @@ and interactive the moment you start it, with no account and no API keys.
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python -m src.generate_sample        # writes data/sample/activities.csv + GPS files + 2 friends
+python -m src.generate_sample        # writes the sample export + GPS files + 2 friends (see below)
 pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
@@ -197,9 +197,21 @@ proprietary one.
 
 A Strava archive also holds the recording of every activity in its `activities/`
 folder (`.gpx`, `.tcx` or `.fit`, usually gzipped). Each is reduced once to a small
-JSON summary in a `.stream_cache` folder beside the export, named after the source
-file's size and modification time, so later page loads only check that a file
-exists. Unreadable files are cached as failures and reported, never fatal.
+summary. All of an export's summaries live in one SQLite file, zlib-compressed and
+keyed by each source file's size and modification time. A page load then reads one
+file with one query, instead of opening a file per run, and only the views that draw
+routes read the route tracks. Unreadable files are cached as failures and reported,
+never fatal.
+
+**Where generated data lives.** The synthetic sample and every cache are kept on this
+machine, outside the project folder: `~/Library/Caches/strava-run-analytics` on macOS,
+`~/.cache/strava-run-analytics` elsewhere, or wherever `STRAVA_DATA_DIR` points. A
+project on an iCloud- or OneDrive-synced Desktop gets its files offloaded, and each
+read of an offloaded file waits about a second for a download, which across hundreds
+of GPS summaries made launch take over ten minutes. An uploaded export keeps its cache
+in its own temporary folder, so the cache is deleted with it. `activities.csv` is read
+for only the ~40 columns the app uses, and once per file version, however many views
+ask for it.
 
 **Moving time.** Pace in `activities.csv` is moving time over distance, so every
 stream computation runs on a moving clock too. A step slower than 0.5 m/s is a stop,
@@ -603,7 +615,7 @@ scored against each runner's *own* threshold pace, so Fitness compares how hard 
 trains relative to their ability, not who is faster. The best-effort and prediction
 tables answer who is faster. Two runs count as *together* when they start within
 15 minutes and their distances differ by at most 15%. `python -m src.generate_sample`
-also writes two synthetic friends to `data/sample/friends/`, which are handy test
+also writes two synthetic friends to the sample's `friends/` folder, which are handy test
 uploads. Alex is quicker on less volume, Sam is slower on more, and both join some of
 the sample runner's long runs.
 
@@ -655,6 +667,7 @@ bests are never slower than whole-run ones. `tests/test_personal_models.py` chec
 Riegel fit and its interval, and that the Banister fit recovers known time constants
 from simulated training. `tests/test_gear.py` covers shoe status. `tests/test_units.py`
 checks the kilometre / mile conversions, and the stream tests cover GPS positions, route
-thinning (a stop adds no points), per-mile splits and pruning of stale cache files.
+thinning (a stop adds no points), per-mile splits, and that the cache is one file kept
+outside the project folder.
 `tests/test_app.py` drives the whole dashboard through Streamlit's `AppTest` — miles,
 a narrower period and the route map in both modes — and fails on any exception.

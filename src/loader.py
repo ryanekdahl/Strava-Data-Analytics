@@ -43,7 +43,10 @@ Fitness and Fatigue.
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -52,7 +55,26 @@ import pandas as pd
 LOGGER = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SAMPLE_CSV = PROJECT_ROOT / "data" / "sample" / "activities.csv"
+
+
+def local_data_root() -> Path:
+    """Where generated data and caches live: on this machine, outside the project folder.
+
+    A project on a cloud-synced Desktop (iCloud, OneDrive) gets its files
+    offloaded, and every read of an offloaded file waits on a download -- about
+    a second each, which across hundreds of GPS summaries made launch take
+    minutes.  ``STRAVA_DATA_DIR`` overrides the location.
+    """
+    override = os.environ.get("STRAVA_DATA_DIR")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "strava-run-analytics"
+    return Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") \
+        / "strava-run-analytics"
+
+
+SAMPLE_CSV = local_data_root() / "sample" / "activities.csv"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 
 CONTRACT_COLUMNS = [
@@ -188,8 +210,23 @@ def _optional_text(series: pd.Series | None, index: pd.Index) -> pd.Series:
     return text.mask(text == "")
 
 
+# Only these of an export's ~90 columns are ever read; the rest are skipped while parsing.
+_WANTED = frozenset(name for names in _CANDIDATES.values() for name in names)
+
+
 def _read_export(path: Path) -> pd.DataFrame:
-    raw = pd.read_csv(path)
+    """The export's useful columns, parsed once per file version and then served from memory.
+
+    ``load_activities`` and ``load_other_activities`` both start here, and the
+    dashboard calls them several times per page, so the parse is shared.
+    """
+    return _parse_export(*_file_version(path)).copy()
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_export(path: str, _mtime_ns: int, _size: int) -> pd.DataFrame:
+    raw = pd.read_csv(path, usecols=lambda column: str(column).strip() in _WANTED,
+                      low_memory=False)
     raw.columns = [str(column).strip() for column in raw.columns]
     return raw
 
@@ -245,13 +282,27 @@ def _numeric_or_nan(raw: pd.DataFrame, key: str) -> pd.Series:
     return values.astype("float64")
 
 
+def _file_version(path: str | Path) -> tuple[str, int, int]:
+    """``(resolved path, mtime_ns, size)``: a memo key that changes whenever the file does."""
+    path = Path(path)
+    stat = path.stat()
+    return str(path.resolve()), stat.st_mtime_ns, stat.st_size
+
+
 def load_activities(path: str | Path = SAMPLE_CSV) -> pd.DataFrame:
     """Read a Strava ``activities.csv`` and return the tidy run-level frame.
 
     Runs are kept, everything else is filtered out, unusable rows (no date,
     non-positive distance or moving time) are dropped, and the number dropped
-    is logged.  The frame is sorted by date with a fresh ``RangeIndex``.
+    is logged.  The frame is sorted by date with a fresh ``RangeIndex``.  The
+    result is memoized per file version, since the dashboard asks for it
+    several times per page; callers get their own copy.
     """
+    return _load_activities(*_file_version(path)).copy()
+
+
+@functools.lru_cache(maxsize=8)
+def _load_activities(path: str, _mtime_ns: int, _size: int) -> pd.DataFrame:
     path = Path(path)
     raw = _read_export(path)
     n_read = len(raw)

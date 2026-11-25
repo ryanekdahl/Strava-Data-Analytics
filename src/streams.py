@@ -21,9 +21,12 @@ turn three activity-level approximations into real measurements:
 
 Parsing is the slow part (a FIT file takes a fraction of a second in pure
 Python, and an export can hold thousands), so each run is reduced once to a
-small JSON summary in a ``.stream_cache`` folder next to the export and only
-re-parsed when its source file changes (the cache file's name carries the
-source's size and modification time).
+small summary and only re-parsed when its source file changes.  Every summary
+of an export lives in one SQLite file (see :func:`cache_dir_for` for where),
+zlib-compressed and keyed by the source file's size and modification time, so
+a page load reads one file with one query instead of opening a file per run,
+and the route tracks -- most of the bytes -- are read only by the views that
+draw them.
 
 Sliding-window best efforts
 ---------------------------
@@ -73,11 +76,15 @@ to the next is far too noisy to read a pace from.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
+import hashlib
 import io
 import json
 import logging
 import math
+import sqlite3
+import zlib
 import xml.etree.ElementTree as ET
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, NamedTuple
@@ -85,9 +92,12 @@ from typing import Callable, Iterable, NamedTuple
 import numpy as np
 import pandas as pd
 
+from src.loader import PROJECT_ROOT, local_data_root
+
 LOGGER = logging.getLogger(__name__)
 
 CACHE_DIR_NAME = ".stream_cache"
+CACHE_FILE = "summaries.sqlite"
 CACHE_VERSION = 4  # bump when the summary format or any computation changes
 
 STREAM_COLUMNS = ["t_s", "distance_m", "hr", "cadence_spm", "altitude_m", "lat", "lon"]
@@ -685,24 +695,76 @@ def summarize_stream(stream: pd.DataFrame) -> dict:
 # --------------------------------------------------------------------------
 
 def cache_dir_for(export_csv: str | Path) -> Path:
-    return Path(export_csv).parent / CACHE_DIR_NAME
+    """The folder holding an export's summary cache.
 
-
-def _cache_path(cache_dir: Path, activity_id: int, source: Path) -> Path:
-    """Cache file for one run, named after the source file's size and mtime.
-
-    Putting the key in the name means checking whether a run is up to date is
-    a single ``stat`` -- no JSON is opened on a page load that has nothing new.
+    Beside the export -- so an upload's cache is deleted with its temporary
+    folder -- except for exports inside the project folder (``data/raw/``),
+    whose cache goes to :func:`src.loader.local_data_root` instead, keyed by the
+    export's location: a cloud-synced project folder would offload it.
     """
+    folder = Path(export_csv).resolve().parent
+    if PROJECT_ROOT in folder.parents or folder == PROJECT_ROOT:
+        key = hashlib.sha1(str(folder).encode()).hexdigest()[:16]
+        return local_data_root() / "stream_cache" / key
+    return folder / CACHE_DIR_NAME
+
+
+def cache_token(export_csv: str | Path) -> int:
+    """Changes whenever an export's summary cache does (0 before it exists)."""
+    db = cache_dir_for(export_csv) / CACHE_FILE
+    return db.stat().st_mtime_ns if db.is_file() else 0
+
+
+def _source_key(source: Path) -> str:
+    """Identifies one version of a source file, so an edited file is parsed again."""
     stat = source.stat()
-    return cache_dir / f"v{CACHE_VERSION}-{int(activity_id)}-{stat.st_size}-{stat.st_mtime_ns}.json"
+    return f"v{CACHE_VERSION}-{stat.st_size}-{stat.st_mtime_ns}"
 
 
-def _read_cache(cache_dir: Path, activity_id: int, source: Path) -> dict | None:
-    try:
-        return json.loads(_cache_path(cache_dir, activity_id, source).read_text())
-    except (OSError, ValueError):
-        return None
+@contextlib.contextmanager
+def _database(cache_dir: Path, create: bool = False):
+    """A connection to the cache, or ``None`` when there is no cache yet and ``create`` is off."""
+    db = cache_dir / CACHE_FILE
+    if not create and not db.is_file():
+        yield None
+        return
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(db, timeout=30)) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS runs (activity_id INTEGER PRIMARY KEY, "
+                     "source_key TEXT NOT NULL, summary BLOB NOT NULL, route BLOB)")
+        yield conn
+
+
+def _pack(value) -> bytes:
+    return zlib.compress(json.dumps(value, separators=(",", ":")).encode(), 6)
+
+
+def _unpack(blob: bytes | None):
+    return None if blob is None else json.loads(zlib.decompress(blob))
+
+
+def _current_rows(cache_dir: Path, activities: pd.DataFrame, export_csv: str | Path,
+                  column: str) -> tuple[dict[int, bytes | None], dict[str, int]]:
+    """``{activity_id: blob}`` of ``column`` for runs whose cached summary is up to date.
+
+    Also counts the runs whose file is ``missing`` or not yet cached, keyed
+    ``"missing"``.  One query reads every row, so loading never opens a file per run.
+    """
+    files = stream_files(activities, export_csv)
+    present = [(aid, path) for aid, path in files if path.is_file()]
+    counts = {"missing": len(files) - len(present)}
+    with _database(cache_dir) as conn:
+        rows = {} if conn is None else {
+            aid: (key, blob) for aid, key, blob in
+            conn.execute(f"SELECT activity_id, source_key, {column} FROM runs")}
+    current = {}
+    for aid, path in present:
+        row = rows.get(aid)
+        if row is None or row[0] != _source_key(path):
+            counts["missing"] += 1
+            continue
+        current[aid] = row[1]
+    return current, counts
 
 
 def stream_files(activities: pd.DataFrame, export_csv: str | Path) -> list[tuple[int, Path]]:
@@ -726,9 +788,11 @@ def stream_files(activities: pd.DataFrame, export_csv: str | Path) -> list[tuple
 
 def pending_files(activities: pd.DataFrame, export_csv: str | Path) -> list[tuple[int, Path]]:
     """Stream files that exist but have no up-to-date cached summary."""
-    cache_dir = cache_dir_for(export_csv)
+    with _database(cache_dir_for(export_csv)) as conn:
+        keys = {} if conn is None else dict(
+            conn.execute("SELECT activity_id, source_key FROM runs"))
     return [(activity_id, path) for activity_id, path in stream_files(activities, export_csv)
-            if path.is_file() and not _cache_path(cache_dir, activity_id, path).is_file()]
+            if path.is_file() and keys.get(activity_id) != _source_key(path)]
 
 
 def cache_summary(activity_id: int, path: Path, cache_dir: Path) -> bool:
@@ -744,6 +808,7 @@ def cache_summary(activity_id: int, path: Path, cache_dir: Path) -> bool:
         if len(stream) < 2:
             raise ValueError("fewer than two timed samples")
         record = {"file": path.name, **summarize_stream(stream)}
+        route = record.pop("route")
         ok = True
     except Exception as err:  # noqa: BLE001 - any unreadable file is skipped, not fatal
         if isinstance(err, OSError) and not isinstance(err, gzip.BadGzipFile):
@@ -751,13 +816,12 @@ def cache_summary(activity_id: int, path: Path, cache_dir: Path) -> bool:
             return False
         LOGGER.warning("Could not read %s: %s", path.name, err)
         record = {"file": path.name, "error": f"{type(err).__name__}: {err}"}
+        route = None
         ok = False
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    target = _cache_path(cache_dir, activity_id, path)
-    for stale in cache_dir.glob(f"v*-{int(activity_id)}-*.json"):
-        if stale != target:  # an older version, or an earlier copy of the file
-            stale.unlink(missing_ok=True)
-    target.write_text(json.dumps(record))
+    with _database(cache_dir, create=True) as conn, conn:
+        conn.execute("INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?)",
+                     (int(activity_id), _source_key(path), _pack(record),
+                      None if route is None else _pack(route)))
     return ok
 
 
@@ -782,18 +846,14 @@ def load_stream_data(activities: pd.DataFrame, export_csv: str | Path) -> Stream
     Runs whose file is missing, unparsed or failed are simply absent, and
     ``status`` says how many of each there were.
     """
-    cache_dir = cache_dir_for(export_csv)
     dates = activities.set_index("activity_id")["date"]
     best_rows, hr_rows, gap_rows, split_frames, mile_frames, run_rows = [], [], [], [], [], []
-    status = {"parsed": 0, "failed": 0, "missing": 0}
-    for activity_id, path in stream_files(activities, export_csv):
-        if not path.is_file():
-            status["missing"] += 1
-            continue
-        cached = _read_cache(cache_dir, activity_id, path)
-        if cached is None or "error" in cached or len(cached.get("best_s", [])) != len(
-                CURVE_DISTANCES_M):
-            status["failed" if cached and "error" in cached else "missing"] += 1
+    blobs, counts = _current_rows(cache_dir_for(export_csv), activities, export_csv, "summary")
+    status = {"parsed": 0, "failed": 0, "missing": counts["missing"]}
+    for activity_id, blob in blobs.items():
+        cached = _unpack(blob)
+        if "error" in cached or len(cached.get("best_s", [])) != len(CURVE_DISTANCES_M):
+            status["failed" if "error" in cached else "missing"] += 1
             continue
         status["parsed"] += 1
         date = dates.get(activity_id)
@@ -840,13 +900,10 @@ def cached_tracks(activities: pd.DataFrame, export_csv: str | Path) -> dict[int,
 
     For comparing routes across runs.  Runs with no cached positions are left out.
     """
-    cache_dir = cache_dir_for(export_csv)
+    blobs, _ = _current_rows(cache_dir_for(export_csv), activities, export_csv, "route")
     tracks = {}
-    for activity_id, path in stream_files(activities, export_csv):
-        if not path.is_file():
-            continue
-        cached = _read_cache(cache_dir, activity_id, path)
-        route = (cached or {}).get("route") or {}
+    for activity_id, blob in blobs.items():
+        route = _unpack(blob) or {}
         if len(route.get("lat") or []) < 2:
             continue
         tracks[activity_id] = pd.DataFrame(
@@ -876,11 +933,17 @@ def route_for(activity_id: int, activities: pd.DataFrame,
     """
     columns = ROUTE_COLUMNS + ["pace_min_per_km", "grade", "gap_pace_min_per_km"]
     path = dict(stream_files(activities, export_csv)).get(int(activity_id))
-    cached = (_read_cache(cache_dir_for(export_csv), activity_id, path)
-              if path is not None and path.is_file() else None)
-    if not cached or not cached.get("route", {}).get("lat"):
+    cached = None
+    if path is not None and path.is_file():
+        with _database(cache_dir_for(export_csv)) as conn:
+            row = None if conn is None else conn.execute(
+                "SELECT source_key, route FROM runs WHERE activity_id = ?",
+                (int(activity_id),)).fetchone()
+        if row is not None and row[0] == _source_key(path):
+            cached = _unpack(row[1])
+    if not cached or not cached.get("lat"):
         return pd.DataFrame(columns=columns, dtype="float64")
-    route = pd.DataFrame(cached["route"], columns=ROUTE_COLUMNS).astype("float64")
+    route = pd.DataFrame(cached, columns=ROUTE_COLUMNS).astype("float64")
     # Pace over a few points either side: GPS jitter makes point-to-point pace unreadable.
     span = 3
     ahead, behind = route.shift(-span).bfill().ffill(), route.shift(span).ffill().bfill()

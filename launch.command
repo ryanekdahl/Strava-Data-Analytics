@@ -30,10 +30,5 @@ if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$REQ_SHA" ]; then
     echo "$REQ_SHA" > "$STAMP"
 fi
 
-if [ ! -f data/sample/activities.csv ]; then
-    echo "Generating sample data ..."
-    "$VENV/bin/python" -m src.generate_sample
-fi
-
 echo "Starting dashboard at http://localhost:8501  (Ctrl+C to stop)"
 exec "$VENV/bin/streamlit" run app.py
