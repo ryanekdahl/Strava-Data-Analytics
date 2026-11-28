@@ -83,7 +83,21 @@ def test_run_replay_plays_on_both_backdrops(app):
 def test_tabs(app):
     assert [tab.label for tab in app.tabs] == [
         "Overview", "Activities", "Routes", "Best efforts", "Fitness & Freshness", "Heart rate",
-        "Gear", "Compare"]
+        "Sleep & readiness", "Gear", "Compare"]
+
+
+def test_sleep_tab_correlates_demo_scores_with_runs(app):
+    assert any("Demo scores" in info.value for info in app.info)
+    assert any("Strongest link" in md.value for md in app.markdown)
+    for metric in ("avg_hr", "efficiency", "pace_min_per_km"):
+        app.selectbox(key="wellness_metric").set_value(metric).run()
+        _assert_clean(app)
+    app.selectbox(key="wellness_score").set_value("readiness").run()
+    _assert_clean(app)
+    for group in app.radio(key="wellness_group").options:
+        app.radio(key="wellness_group").set_value(group).run()
+        _assert_clean(app)
+    app.radio(key="wellness_group").set_value("All runs").run()
 
 
 def test_routes_tab_shows_the_pr_heat_map_for_each_route(app):

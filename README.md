@@ -23,9 +23,9 @@ pytest -q                            # tests pass
 streamlit run app.py                 # dashboard opens on synthetic data
 ```
 
-Python 3.11+. The dashboard has seven tabs, covering the stats Strava itself shows plus
+Python 3.11+. The dashboard has eight tabs, covering the stats Strava itself shows plus
 a Fitness & Freshness tab with workload management for serious runners: Overview,
-Activities, Routes, Best efforts, Fitness & Freshness, Heart rate and Gear. The sidebar has a
+Activities, Routes, Best efforts, Fitness & Freshness, Heart rate, Sleep & readiness and Gear. The sidebar has a
 switch between the bundled sample data and your own export (uploaded as Strava's zip,
 or found in `data/raw/`), a **period** (all time, the last 12 / 6 / 3 months or 4 weeks,
 a calendar year, or a custom range), **kilometres or miles**, and your resting and max
@@ -41,6 +41,7 @@ heart rate.
 | **Best efforts** | **PR watch**: your best of the last 90 days at each distance against your all-time record, flagging the PRs within reach (≤3% off) and the even pace that would break them, plus a teaser on the Overview; true in-run best efforts from the GPS files (or whole-run PRs without them), Riegel race predictions from current form, and a race-time calculator |
 | **Fitness & Freshness** | Fitness, Fatigue and Form (CTL / ATL / TSB) over time with today's reading, the acute:chronic workload ratio against its sweet-spot band, and the exact load formula behind both. Rides, swims and other sessions count toward the load |
 | **Heart rate** | Share of time in zones Z1–Z5 (second by second when the GPS files are present), monthly hours by zone, and each zone's bpm range |
+| **Sleep & readiness** | Upload Apple Health's export (or a CSV from an app that scores sleep) and each run is paired with that morning's **sleep score** and **readiness**: a correlation grid against pace, average heart rate and metres per heartbeat, a scatter for any pair with its trend line and 95% interval, the average for the lowest, middle and highest third of mornings, and the score over time. Narrow to short, medium or long runs to compare like with like — see `src/wellness.py` |
 | **Gear** | Distance on each shoe, with a warning when one nears its retirement mileage |
 
 ## Methodology
@@ -510,6 +511,59 @@ visit, so the first load takes a little longer. Visitors land on the demo data a
 upload their own archive from the sidebar; each visitor's upload and friends live
 in their own session folder, so nobody sees anyone else's data.
 
+### Sleep score and readiness — `src/wellness.py`
+
+**Input.** Apple Health's `export.zip` (Health > your picture > *Export All Health
+Data*), unchanged, or the `export.xml` inside it; or a CSV with a date column and a
+sleep-score and/or readiness column (`date,sleep_score,readiness`, or vendor names such
+as `Sleep Score` and `Recovery %`). The XML can run to several GB, so it is streamed
+from the zip and searched in 32 MB chunks for just four kinds of record: sleep stages,
+overnight HRV (SDNN), resting heart rate, and any record whose type names a sleep score
+or readiness. Nothing is written to disk; only the small daily table is kept, in the
+session.
+
+**Dates are the morning a number describes**, so each run is paired with the night
+before it. A sleep segment ending at or after 15:00 belongs to the next morning.
+
+**Sleep score (0–100).** Where Apple Health holds a score of its own it is used as-is.
+Otherwise, from the Watch's sleep stages: the source with the most sleep that night is
+kept (Watch and iPhone both record it), segments are split into blocks at gaps over 2 h,
+and the block with the most sleep is the night, so naps are ignored. Then
+
+| Part | Points | Full marks | Zero |
+|---|---|---|---|
+| Duration asleep | 50 | 8 h or more | 4 h or less |
+| Bedtime vs your median of the previous 14 nights | 30 | within 30 min | 2 h off |
+| Time awake between falling asleep and waking | 20 | none | 60 min or more |
+
+linear in between. The weighting follows Apple's own Sleep Score. With fewer than 5
+earlier nights the bedtime part is left out and the other two are rescaled to 100.
+
+**Readiness (0–100).** Again Apple's or an app's own where present; otherwise, how this
+morning's overnight HRV (readings from 20:00 to 10:00, averaged) and resting heart rate
+compare with your previous 60 days (at least 14 readings), each as a z-score capped at ±3:
+
+```
+readiness = 70 + 15 × (0.6 × z(ln HRV) − 0.4 × z(resting HR))
+```
+
+HRV is logged because it is right-skewed. 70 is a typical morning, and one standard
+deviation better than usual on both adds about 10. Sleep is left out on purpose, so the
+two scores measure different things.
+
+**Run measures.** Pace (lower is faster), average heart rate, and **metres per
+heartbeat**, `speed (m/min) / avg_hr`, which rises when you run faster for the same
+effort. A tempo run and an easy run differ in pace and heart rate by far more than a
+night's sleep can move either, so efficiency, and the short / medium / long filter
+(under 8 km, 8–15 km, 15 km and over), compare like with like.
+
+**Statistics.** Pearson's r over the runs where both values exist, reported only from
+10 runs up, with a 95% interval from Fisher's z transformation,
+`tanh(atanh(r) ± 1.96 / √(n − 3))`. The thirds chart splits run mornings into three
+equal groups by score and shows each group's mean with a 95% interval (±1.96 standard
+errors). The sample data comes with made-up scores that lean slightly on how good each
+run was, so the demo has a link to find.
+
 ## Limitations
 
 - **Without the GPS files, best efforts are activity-level.** A "5K PR" from
@@ -524,6 +578,11 @@ in their own session folder, so nobody sees anyone else's data.
 - **Threshold pace is estimated, not tested.** It comes from the fastest decile of
   your own runs, which drifts as you get fitter. It is not a lab or field test, and
   a period of only easy running will bias it slow.
+- **Sleep and readiness links are correlations, not causes.** A late night, a hot day
+  and a slow run can share a cause (travel, illness, stress), and months of getting
+  fitter move pace whatever your sleep. Computed scores are transparent approximations,
+  not Apple's or Oura's algorithms; where Apple Health holds its own score, that is
+  used instead.
 - **`hr_rest` and `hr_max` default to 60 and 190**, which are not your values.
   Set yours in the sidebar: the heart-rate half of the load score and every zone
   boundary are only as good as those two numbers.
@@ -579,7 +638,8 @@ in their own session folder, so nobody sees anyone else's data.
 │   ├── sports.py               # rides, swims, gym... scored on the runs' load axis
 │   ├── gear.py                 # shoe mileage and retirement
 │   ├── units.py                # kilometres / miles display conversion
-│   ├── recovery.py             # sleep / HRV import and correlations
+│   ├── recovery.py             # sleep / HRV against training load (not shown in the app)
+│   ├── wellness.py             # Apple Health sleep score / readiness vs each run
 │   ├── upload.py               # uploaded archives -> private per-session temp folder
 │   └── plots.py                # plotly figure builders
 └── tests/                      # pytest: loader contract, load model, predictions, workload

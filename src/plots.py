@@ -407,6 +407,129 @@ def recovery_scatter_figure(
     return _base(fig, height=400, y_title=y_title, x_title=x_title)
 
 
+def _run_metric_values(values: pd.Series, metric: str, units: Units) -> pd.Series:
+    """A run metric in display units (only pace changes with km/mi)."""
+    return units.pace(values) if metric == "pace_min_per_km" else values
+
+
+def _run_metric_title(metric: str, label: str, units: Units) -> str:
+    return {"pace_min_per_km": f"Pace ({units.pace_label})", "avg_hr": f"{label} (bpm)"}.get(
+        metric, label)
+
+
+def wellness_correlation_figure(table: pd.DataFrame) -> go.Figure:
+    """Pearson r for each score x run metric, coloured by sign and strength.
+
+    Diverging scale: blue for positive, orange for negative, a neutral gray at
+    zero; the colour shows the direction of the number, not whether it is good
+    (a negative r with pace means faster).  Each cell is labelled with r and n.
+    """
+    rows = list(dict.fromkeys(table["wellness_label"]))
+    cols = list(dict.fromkeys(table["metric_label"]))
+    grid = table.pivot(index="wellness_label", columns="metric_label", values="r")
+    counts = table.pivot(index="wellness_label", columns="metric_label", values="n")
+    grid, counts = grid.loc[rows, cols], counts.loc[rows, cols]
+    text = [[(f"r = {r:+.2f}<br>n = {n:.0f}" if np.isfinite(r) else f"too few<br>n = {n:.0f}")
+             for r, n in zip(r_row, n_row)]
+            for r_row, n_row in zip(grid.to_numpy(), counts.to_numpy())]
+    fig = go.Figure(go.Heatmap(
+        x=cols, y=rows, z=grid.to_numpy(), text=text, texttemplate="%{text}",
+        textfont=dict(color=INK, size=13), zmin=-0.6, zmax=0.6, zmid=0.0,
+        colorscale=[[0.0, SERIES["fatigue"]], [0.5, "#f0efec"], [1.0, SERIES["fitness"]]],
+        colorbar=dict(title=dict(text="r"), thickness=12, outlinewidth=0,
+                      tickvals=[-0.6, -0.3, 0, 0.3, 0.6]),
+        xgap=2, ygap=2, hoverongaps=False,
+        hovertemplate="%{y} vs %{x}<br>%{text}<extra></extra>",
+    ))
+    fig.update_layout(title="How each score lines up with your runs", hovermode="closest")
+    _base(fig, height=150 + 70 * len(rows))
+    fig.update_yaxes(autorange="reversed", showgrid=False, tickfont=dict(color=INK_SECONDARY))
+    fig.update_xaxes(showline=False, ticks="", tickfont=dict(color=INK_SECONDARY))
+    return fig
+
+
+def wellness_scatter_figure(joined: pd.DataFrame, wellness: str, metric: str,
+                            wellness_label: str, metric_label: str, stats: dict,
+                            units: Units = METRIC) -> go.Figure:
+    """One dot per run: the morning's score across, the run's metric up, with a trend line."""
+    pair = joined.dropna(subset=[wellness, metric])
+    y = _run_metric_values(pair[metric], metric, units)
+    if metric == "pace_min_per_km":
+        shown = [format_pace(v, suffix=f" /{units.distance_label}") for v in y]
+    elif metric == "avg_hr":
+        shown = [f"{v:.0f} bpm" for v in y]
+    else:
+        shown = [f"{v:.2f} m per beat" for v in y]
+    custom = np.column_stack([pair["date"].dt.strftime("%d %b %Y"), pair["name"],
+                              [units.format_distance(d) for d in pair["distance_km"]], shown])
+    fig = go.Figure(go.Scatter(
+        x=pair[wellness], y=y, name="Run", mode="markers",
+        marker=dict(color=SERIES["fitness"], size=9, opacity=0.6,
+                    line=dict(width=1, color=SURFACE)),
+        customdata=custom,
+        hovertemplate=(f"<b>%{{customdata[1]}}</b><br>%{{customdata[0]}} · %{{customdata[2]}}"
+                       f"<br>{wellness_label} %{{x:.0f}} · %{{customdata[3]}}<extra></extra>"),
+    ))
+    if len(pair) >= 2 and pair[wellness].std() > 0:
+        slope, intercept = np.polyfit(pair[wellness], y, 1)
+        xs = np.array([pair[wellness].min(), pair[wellness].max()])
+        fig.add_trace(go.Scatter(
+            x=xs, y=slope * xs + intercept, name="Trend", mode="lines",
+            line=dict(color=INK_SECONDARY, width=2), hoverinfo="skip",
+        ))
+    r = stats["r"]
+    if np.isfinite(r) and np.isfinite(stats["low"]):
+        r_text = f"r = {r:+.2f}, 95% CI {stats['low']:+.2f} to {stats['high']:+.2f}"
+    elif np.isfinite(r):
+        r_text = f"r = {r:+.2f}"
+    else:
+        r_text = "r not available"
+    fig.update_layout(title=f"{metric_label} vs {wellness_label.lower()} "
+                            f"({r_text}, {len(pair)} runs)",
+                      hovermode="closest", showlegend=False)
+    _base(fig, height=420, y_title=_run_metric_title(metric, metric_label, units),
+          x_title=f"{wellness_label} that morning")
+    if metric == "pace_min_per_km":
+        _pace_axis(fig, y)
+    return fig
+
+
+def wellness_thirds_figure(summary: pd.DataFrame, wellness_label: str, metric: str,
+                           metric_label: str, units: Units = METRIC) -> go.Figure:
+    """Mean run metric for the lowest, middle and highest third of mornings, with 95% CIs.
+
+    Points with whiskers rather than bars: a pace or heart-rate bar from zero
+    would hide the small differences that matter.
+    """
+    mean = _run_metric_values(summary["mean"], metric, units)
+    low = _run_metric_values(summary["low"], metric, units)
+    high = _run_metric_values(summary["high"], metric, units)
+    labels = [f"{band}<br><sup>{lo:.0f}–{hi:.0f} · {n} runs</sup>"
+              for band, lo, hi, n in zip(summary["band"], summary["score_low"],
+                                         summary["score_high"], summary["n"])]
+    if metric == "pace_min_per_km":
+        shown = [format_pace(v, suffix=f" /{units.distance_label}") for v in mean]
+    elif metric == "avg_hr":
+        shown = [f"{v:.0f} bpm" for v in mean]
+    else:
+        shown = [f"{v:.2f} m per beat" for v in mean]
+    fig = go.Figure(go.Scatter(
+        x=labels, y=mean, mode="markers+text", text=shown, textposition="middle right",
+        textfont=dict(color=INK_SECONDARY),
+        marker=dict(color=SERIES["fitness"], size=12, line=dict(width=2, color=SURFACE)),
+        error_y=dict(type="data", symmetric=False, array=high - mean, arrayminus=mean - low,
+                     color=MUTED, thickness=2, width=6),
+        hovertemplate="%{x}<br>Average %{text}<extra></extra>",
+    ))
+    fig.update_layout(title=f"Average {metric_label.lower()} by {wellness_label.lower()}",
+                      hovermode="closest", showlegend=False)
+    _base(fig, height=380, y_title=_run_metric_title(metric, metric_label, units))
+    fig.update_xaxes(range=[-0.4, len(summary) - 0.2])  # room for the last point's label
+    if metric == "pace_min_per_km":
+        _pace_axis(fig, pd.concat([low, high]))
+    return fig
+
+
 def race_plan_figure(projection: pd.DataFrame, race_ready: tuple[float, float],
                      ctl_days: int = 42, atl_days: int = 7, history_days: int = 90) -> go.Figure:
     """The last ``history_days`` of Fitness, Fatigue and Form, then the plan dotted to race day."""

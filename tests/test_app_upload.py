@@ -129,3 +129,33 @@ def test_a_bad_comparison_upload_explains_itself():
     at.run()
     _assert_clean(at)
     assert any("not a valid zip" in error.value for error in at.error)
+
+
+def test_sleep_scores_upload_and_remove():
+    at = AppTest.from_file(str(APP), default_timeout=TIMEOUT_S)
+    at.run()
+    runs = pd.read_csv(SAMPLE_CSV)
+    days = pd.to_datetime(runs["Activity Date"], format="mixed").dt.normalize().unique()
+    rows = "".join(f"{day:%Y-%m-%d},{70 + i % 20},{60 + i % 30}\n"
+                   for i, day in enumerate(days))
+    csv = ("date,Sleep Score,Readiness\n" + rows).encode()
+    _uploader(at, "wellness_file").set_value(("scores.csv", csv, "text/csv"))
+    at.run()
+    _assert_clean(at)
+    assert not any("Demo scores" in info.value for info in at.info)
+    assert any("scores.csv" in caption.value for caption in at.caption)
+    assert at.session_state["wellness"][1] is not None
+
+    at.button(key="wellness_remove").click()
+    at.run()
+    _assert_clean(at)
+    assert any("Demo scores" in info.value for info in at.info)
+
+
+def test_a_bad_sleep_upload_explains_itself():
+    at = AppTest.from_file(str(APP), default_timeout=TIMEOUT_S)
+    at.run()
+    _uploader(at, "wellness_file").set_value(("scores.csv", b"a,b\n1,2\n", "text/csv"))
+    at.run()
+    _assert_clean(at)
+    assert any("could not be read" in error.value for error in at.error)
