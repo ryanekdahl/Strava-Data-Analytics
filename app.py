@@ -33,7 +33,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from src import compare, pace_heat, plots, replay, routes, streams, terrain, upload
+from src import (
+    compare, pace_heat, plots, replay, routes, streams, terrain, upload, wellness,
+)
 from src.consistency import (
     SWEET_SPOT, acwr_status, compute_acwr, monthly_volume, summary_kpis,
     weekly_streaks, weekly_volume,
@@ -1321,6 +1323,204 @@ def compare_tab(units: Units) -> None:
                    f"differ in distance by at most {SHARED_DISTANCE_TOLERANCE:.0%}.")
 
 
+def forget_wellness() -> None:
+    """Drop the uploaded sleep/readiness data and reset its uploader."""
+    st.session_state.pop("wellness", None)
+    st.session_state["wellness_generation"] = st.session_state.get("wellness_generation", 0) + 1
+
+
+def wellness_upload(box) -> tuple[pd.DataFrame, str] | None:
+    """The Sleep & readiness uploader; returns ``(daily scores, file name)`` once read.
+
+    Only the small daily table is kept, in this session's memory -- the export
+    itself is streamed once and never written to disk.
+    """
+    generation = st.session_state.get("wellness_generation", 0)
+    file = box.file_uploader(
+        "Apple Health export, or a sleep / readiness CSV", type=["zip", "xml", "csv"],
+        key=f"wellness_file_{generation}",
+        help="Apple Health's export.zip unchanged, the export.xml inside it, or a CSV with "
+             "date, sleep_score and readiness columns.")
+    if file is None:
+        st.session_state.pop("wellness", None)
+        return None
+    upload_id = f"{file.file_id}:{file.name}:{file.size}"
+    stored = st.session_state.get("wellness")
+    if stored is not None and stored[0] == upload_id:
+        if stored[1] is None:
+            box.error(stored[2])
+            return None
+        return stored[1], file.name
+    try:
+        with st.spinner(f"Reading {file.name}... a full Apple Health export can take a minute."):
+            scores = wellness.load_wellness(file, file.name)
+        problem = None
+    except (wellness.WellnessError, ValueError, KeyError, pd.errors.ParserError,
+            UnicodeDecodeError, OSError) as err:
+        scores, problem = None, f"That file could not be read: {err}"
+    st.session_state["wellness"] = (upload_id, scores, problem)
+    if problem is not None:
+        box.error(problem)
+        return None
+    return scores, file.name
+
+
+def wellness_source_note(scores: pd.DataFrame) -> str:
+    """Where the scores came from: Apple's own, or this dashboard's formulas."""
+    parts = []
+    for key, label in wellness.WELLNESS_METRICS.items():
+        flag = f"{key}_native"
+        have = scores[key].notna()
+        if flag not in scores.columns or not have.any():
+            continue
+        native = int((scores[flag] & have).sum())
+        computed = int(have.sum()) - native
+        bits = ([f"{native:,} from Apple Health"] if native else []) + (
+            [f"{computed:,} computed here"] if computed else [])
+        parts.append(f"{label}: {' and '.join(bits)}")
+    return (" · ".join(parts) + ". Computed scores follow the formulas under "
+            "**How the scores are worked out**.") if parts else ""
+
+
+def wellness_tab(data: dict, path: Path) -> None:
+    """Sleep score and readiness from Apple Health against each run's pace and heart rate."""
+    units, runs = data["units"], data["activities"]
+    st.markdown("Do you run faster, or at a lower heart rate, after a good night? Upload "
+                "your **sleep score** and **readiness** and each run is paired with the "
+                "scores from that morning.")
+    upload_col, help_col = st.columns([3, 2])
+    uploaded = wellness_upload(upload_col)
+    if uploaded is not None and upload_col.button(
+            "Remove sleep data", key="wellness_remove",
+            help="Forgets the uploaded scores from this session, now."):
+        forget_wellness()
+        st.rerun()
+    with help_col.expander("How to export from Apple Health"):
+        st.markdown(
+            "1. On your iPhone open **Health**, tap your picture (top right).\n"
+            "2. Tap **Export All Health Data** and **Export**; it can take a few minutes.\n"
+            "3. Send the **export.zip** to this computer (AirDrop, Files) and upload it "
+            "here unchanged.\n\n"
+            "The Watch's sleep stages, overnight HRV and resting heart rate are read from it. "
+            "Where Apple Health holds its own Sleep Score or a readiness score it is used "
+            "as-is; otherwise both are worked out from those readings. Using an app with its "
+            "own scores (Athlytic, Bevel, Oura, Whoop...)? Upload its CSV export instead, or "
+            "fill in the template.")
+        st.download_button("Download a CSV template", wellness.TEMPLATE_CSV,
+                           "sleep_readiness_template.csv", "text/csv",
+                           key="wellness_template")
+
+    if uploaded is not None:
+        scores, origin = uploaded
+    elif path == SAMPLE_CSV:
+        scores, origin = wellness.synthetic_wellness(data["all_activities"]), None
+        st.info("**Demo scores** -- made-up sleep and readiness for the demo runner, so "
+                "there is something to explore. Upload your own Apple Health export above.",
+                icon=":material/bedtime:")
+    else:
+        st.info("Upload your Apple Health export (or a CSV of scores) to see how your sleep "
+                "and readiness line up with your runs.", icon=":material/bedtime:")
+        return
+
+    joined = wellness.join_runs(scores, runs)
+    if joined.empty:
+        st.warning(f"None of the {len(scores):,} mornings in that file "
+                   f"({scores['date'].min():%d %b %Y} to {scores['date'].max():%d %b %Y}) "
+                   "fall on a day you ran in this period.")
+        return
+    if origin is not None:
+        note = wellness_source_note(scores)
+        st.caption(f"Read **{origin}**: {len(scores):,} mornings. {note}")
+
+    cards = st.columns(4)
+    cards[0].metric("Runs with scores", f"{len(joined):,}",
+                    delta=f"of {len(runs):,} in the period", delta_color="off")
+    for card, (key, label) in zip(cards[1:3], wellness.WELLNESS_METRICS.items()):
+        value = joined[key].mean()
+        card.metric(f"Typical {label.lower()} on run days",
+                    f"{value:.0f}" if np.isfinite(value) else "--")
+    with_hr = joined["avg_hr"].notna().sum()
+    cards[3].metric("Runs with heart rate", f"{with_hr:,}")
+
+    groups = {"All runs": "All runs"}
+    for key in ("Short", "Medium", "Long"):
+        low, high = wellness.RUN_GROUPS[key]
+        span = (f"under {units.format_distance(high, 0)}" if low == 0
+                else f"{units.format_distance(low, 0)}+" if not np.isfinite(high)
+                else f"{units.format_distance(low, 0)}–{units.format_distance(high, 0)}")
+        groups[f"{key} ({span})"] = key
+    choice = st.radio("Runs", list(groups), horizontal=True, key="wellness_group",
+                      help="Easy, tempo and long runs differ in pace and heart rate far more "
+                           "than one night's sleep can move them; comparing runs of a similar "
+                           "length makes a link easier to see.")
+    subset = wellness.in_group(joined, groups[choice])
+    table = wellness.correlation_table(subset)
+
+    st.plotly_chart(plots.wellness_correlation_figure(table), width="stretch")
+    found = table.dropna(subset=["r"])
+    if found.empty:
+        st.info(f"At least {wellness.MIN_PAIRS} runs with a score are needed for a "
+                "correlation; try **All runs** or a longer period.")
+        return
+    top = found.loc[found["r"].abs().idxmax()]
+    st.markdown(f"**Strongest link:** {top['metric_label'].lower()} with "
+                f"{top['wellness_label'].lower()} ({top['strength'].lower()}, "
+                f"r = {top['r']:+.2f}). {wellness.reading(top)}")
+    st.caption("r runs from -1 to +1; 0 means no straight-line link. Blue cells are "
+               "positive and orange negative. For pace a *negative* r means faster after "
+               "higher scores, because a smaller pace number is faster.")
+
+    st.subheader("Look closer")
+    left, right = st.columns(2)
+    available = [k for k in wellness.WELLNESS_METRICS if subset[k].notna().any()]
+    wellness_key = left.selectbox("Score", available, key="wellness_score",
+                                  format_func=wellness.WELLNESS_METRICS.get)
+    metric_key = right.selectbox("Run measure", list(wellness.RUN_METRICS),
+                                 key="wellness_metric", format_func=wellness.RUN_METRICS.get)
+    row = table.set_index(["wellness", "metric"]).loc[(wellness_key, metric_key)]
+    stats = {"r": row["r"], "n": row["n"], "low": row["low"], "high": row["high"]}
+    wellness_label = wellness.WELLNESS_METRICS[wellness_key]
+    metric_label = wellness.RUN_METRICS[metric_key]
+    st.plotly_chart(plots.wellness_scatter_figure(
+        subset, wellness_key, metric_key, wellness_label, metric_label, stats, units),
+        width="stretch")
+    st.caption(wellness.reading({**stats, "wellness_label": wellness_label,
+                                 "metric_label": metric_label, "metric": metric_key}))
+    summary = wellness.thirds(subset, wellness_key, metric_key)
+    if not summary.empty:
+        st.plotly_chart(plots.wellness_thirds_figure(summary, wellness_label, metric_key,
+                                                     metric_label, units), width="stretch")
+        st.caption("Your run mornings split into three equal groups by score. Whiskers are "
+                   "95% confidence intervals for each group's average; where they overlap a "
+                   "lot, the difference could easily be chance.")
+
+    start, end = runs["date"].min().normalize(), runs["date"].max().normalize()
+    nights = scores[(scores["date"] >= start) & (scores["date"] <= end)].reset_index(drop=True)
+    if nights[wellness_key].notna().sum() >= 3:
+        nights = nights.dropna(subset=[wellness_key]).reset_index(drop=True)
+        st.plotly_chart(plots.recovery_timeline_figure(
+            nights, wellness_key, wellness.baseline(nights, wellness_key),
+            f"{wellness_label} each morning", wellness_label), width="stretch")
+
+    with st.expander("How the scores are worked out"):
+        st.markdown(
+            "**Sleep score (0–100)** when Apple Health has none: *duration* up to 50 pts "
+            "(0 at 4 h asleep, full at 8 h), *bedtime* up to 30 pts (full within 30 min of "
+            "your usual bedtime over the last 14 nights, 0 at 2 h off) and *interruptions* "
+            "up to 20 pts (0 at an hour or more awake in the night), the same weighting as "
+            "Apple's own Sleep Score. Naps are left out.\n\n"
+            "**Readiness (0–100)** when Apple Health has none: how this morning's overnight "
+            "HRV and resting heart rate compare with your own previous 60 days, "
+            "`70 + 15 × (0.6 × z(ln HRV) − 0.4 × z(resting HR))`. 70 is a typical morning.\n\n"
+            "**Metres per heartbeat** is speed divided by average heart rate. It rises "
+            "when you run faster for the same effort, so easy and hard runs compare more "
+            "fairly than on pace or heart rate alone.\n\n"
+            "**Correlation** is Pearson's r with a 95% interval (Fisher z). It shows "
+            "association, not cause: a late night, a hot day and a slow run can share a "
+            "cause, and getting fitter over months changes pace whatever your sleep. "
+            "Full details in `src/wellness.py`.")
+
+
 def main() -> None:
     path = choose_source()
     period_box = st.sidebar.container()  # filled once the runs are loaded
@@ -1362,9 +1562,10 @@ def main() -> None:
     data["near_pr"] = near_pr_table(all_streams.best if has_gps
                                     else whole_run_efforts(all_activities))
 
-    overview, run_detail, route_tab, efforts, fitness, heart_rate, gear, compare_view = st.tabs(
+    (overview, run_detail, route_tab, efforts, fitness, heart_rate, sleep, gear,
+     compare_view) = st.tabs(
         ["Overview", "Activities", "Routes", "Best efforts", "Fitness & Freshness",
-         "Heart rate", "Gear", "Compare"]
+         "Heart rate", "Sleep & readiness", "Gear", "Compare"]
     )
     with overview:
         overview_tab(data)
@@ -1378,6 +1579,8 @@ def main() -> None:
         fitness_tab(data)
     with heart_rate:
         heart_rate_tab(data, stream_data)
+    with sleep:
+        wellness_tab(data, path)
     with gear:
         gear_tab(data)
     with compare_view:
